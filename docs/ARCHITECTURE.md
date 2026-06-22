@@ -252,6 +252,74 @@ The geometry is verified against the Berkeley→Stanford Marathon route
 ($d \approx 50$ km, $\theta \approx 171°$) and the controller is shown converging
 to a checkpoint in a kinematic simulation over real HTTP (§13).
 
+### 7.1 Closed-loop fused navigation (sensor fusion + pursuit + safety)
+
+A real ground robot does not steer off raw 1 Hz GPS and a raw compass — those
+signals are noisy enough to *fake* a checkpoint arrival. The kit therefore ships a
+closed-loop **navigation stack** (`estimator.py` + `control.py`) wrapped by
+`NavController` and driven by `goto_checkpoint_fused()` as the production autonomy
+path; the bang-bang `goto_checkpoint` of §7 is retained as the baseline.
+
+**Heading estimation.** A PI complementary filter fuses the fast-but-drifting gyro
+with the slow-but-absolute magnetometer/orientation. A *plain* complementary filter
+leaves a steady-state offset of $\approx b\,\Delta t/k_p$ under a constant gyro bias
+$b$; an integral term learns and removes that bias online (Mahony-style):
+$$\hat\psi \leftarrow \hat\psi + (\omega_z-\hat b)\,\Delta t,\qquad
+  \hat\psi \leftarrow \hat\psi + k_p\,e_\psi,\qquad
+  \hat b \leftarrow \hat b - k_i\,e_\psi\,\Delta t$$
+
+**Pose estimation.** Dead-reckon local-ENU position from wheel odometry (or a
+commanded-velocity proxy when none is exposed) along $\hat\psi$, pulled toward each
+GPS fix by $k_\text{gps}$:
+$$(x,y)\mathrel{+}=\Delta s\,(\sin\hat\psi,\cos\hat\psi),\qquad
+  (x,y)\mathrel{+}=k_\text{gps}\big((x_\text{gps},y_\text{gps})-(x,y)\big)$$
+
+**Pursuit control.** A single-target pure-pursuit reduction — curvature steering
+plus approach slow-down — replaces turn-then-go bang-bang ($\alpha$ = signed bearing
+error to the goal):
+$$\omega=\operatorname{clamp}(-k_\text{ang}\sin\alpha,-1,1),\qquad
+  u=v_\text{max}\,\max(0,\cos\alpha)\,\min(1,\,d/d_\text{slow})$$
+
+**Safety envelope.** Every command is gated: battery floor, tilt cutoff
+(ramp/pickup/stuck), and lidar time-to-collision $\text{TTC}=d_\text{front}/u$ —
+hard-stop below `ttc_min`, linearly scale speed below `ttc_slow`.
+
+```mermaid
+flowchart LR
+  subgraph SEN["telemetry (/data)"]
+    O["orientation / IMU"]
+    G["GPS lat/lon (1 Hz)"]
+    LB["battery, tilt, lidar"]
+  end
+  subgraph EST["estimator.py"]
+    HF["HeadingFilter<br/>PI complementary + bias est"]
+    PF["PoseFilter<br/>dead-reckon + GPS correct"]
+  end
+  subgraph CTL["control.py NavController"]
+    PP["PursuitController<br/>curvature steer + slow-down"]
+    SE["SafetyEnvelope<br/>battery, tilt, TTC"]
+  end
+  O --> HF
+  G --> PF
+  HF --> PF
+  HF --> PP
+  PF --> PP
+  PP --> SE
+  LB --> SE
+  SE -->|twist| RB["/control linear, angular"]
+  RB -.->|robot moves| SEN
+```
+*Figure 6b — the fused closed loop. `NavController` composes the estimator, pursuit
+controller, and safety envelope behind one `step(telemetry) → twist`.*
+
+**Why it matters (validated A/B).** In a noisy kinematic simulation
+(`tests/live/test_live_navstack.py`; GPS $\sigma=4$ m, gyro bias $3°/\text{s}$,
+magnetometer $\sigma=8°$) the same truth and noise sequence drive both controllers.
+The bang-bang baseline acts on raw GPS and **declares arrival 19.2 m from the
+checkpoint — a missed checkpoint at the 15 m Urban-track tolerance** — while the
+fused stack tracks heading **2.2× better than the raw magnetometer** and **truly
+arrives within tolerance (14.8 m)**.
+
 ---
 
 ## 8. Visual servoing: `track_color`
@@ -356,6 +424,10 @@ sequenceDiagram
 ```mermaid
 graph TD
   geo["geo.py"] --> rover["rover.py"]
+  geo --> estimator["estimator.py"]
+  geo --> control["control.py"]
+  estimator --> control
+  control --> rover
   client["client.py"] --> rover
   harness["harness_client.py"] --> rover
   client --> work["work.py"]
@@ -414,15 +486,16 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 40 tests (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators"]
+  subgraph H["Hermetic suite &mdash; 48 tests (stubbed httpx / anthropic)"]
+    HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack"]
   end
-  subgraph L["Live suite &mdash; 5 tests (real I/O, no stubs)"]
+  subgraph L["Live suite &mdash; 6 tests (real I/O, no stubs)"]
     L1["harness: real httpx &harr; HTTP emulator"]
     L2["mcp: real protocol &harr; dispatch"]
     L3["track_color: real HSV on generated JPEG"]
     L4["navigate: real geo &harr; kinematic sim"]
-    L5["walrus: real testnet store + retrieve"]
+    L5["navstack: fused vs bang-bang, noisy sim"]
+    L6["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
@@ -433,6 +506,7 @@ flowchart TB
 | mcp | real MCP `initialize → list_tools → call_tool` → `dispatch` → HTTP; `ImageContent` |
 | track_color | real HSV detection + servo on real generated JPEGs (right-blob → turn-right; arrival stop) |
 | navigate | real geo + the `goto_checkpoint` controller converging to a checkpoint (65 m → 9 m) in a 2-D kinematic sim |
+| navstack | fused `NavController` vs bang-bang baseline on the same noisy truth: baseline false-arrives 19.2 m out; fused arrives truly (14.8 m), heading 2.2× better than raw mag |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
 
 > **Scope of validation.** The plumbing, protocols, content-addressing, geometry,

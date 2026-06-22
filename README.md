@@ -264,9 +264,18 @@ SDK), with real GPS waypoint navigation:
   controller (the autonomous baseline), or let Claude drive via `navigate` +
   `look` + `move`/`turn` (the VLM-agent baseline — vision handles obstacles GPS
   can't see). See [`examples/earth_rover_challenge.py`](examples/earth_rover_challenge.py).
+- `EarthRoverVerbs.goto_checkpoint_fused()` — the **closed-loop navigation stack**
+  (`estimator.py` + `control.py`): a PI complementary heading filter with online
+  gyro-bias estimation, a GPS-corrected dead-reckoning pose filter, pure-pursuit
+  steering, and a safety envelope (battery / tilt / lidar time-to-collision),
+  composed behind `NavController.step(telemetry) → twist`. In a noisy A/B sim the
+  bang-bang baseline *false-arrives 19.2 m* from the checkpoint (a miss at 15 m
+  tolerance) while the fused stack *truly arrives* (14.8 m) and tracks heading
+  2.2× better than the raw magnetometer. See [§7.1 of the architecture spec](docs/ARCHITECTURE.md#71-closed-loop-fused-navigation-sensor-fusion--pursuit--safety).
 
-The live test drives a 2D kinematic rover sim over real HTTP to a GPS checkpoint
-(`tests/live/test_live_navigate.py`).
+The live tests drive a 2D kinematic rover sim over real HTTP to a GPS checkpoint
+(`tests/live/test_live_navigate.py`) and run the fused-vs-baseline A/B under
+sensor noise (`tests/live/test_live_navstack.py`).
 
 ## Waveshare as a LeRobot robot
 
@@ -285,6 +294,8 @@ mini_plus_agent_kit/
   client.py          EarthRoverClient   — FrodoBots SDK transport (+ openClaw verbs)
   harness_client.py  HarnessClient      — Waveshare robot-harness transport
   rover.py           RoverVerbs         — openClaw verb surface (2 backends)
+  estimator.py       HeadingFilter/PoseFilter — sensor fusion (gyro+mag, odom+GPS)
+  control.py         NavController       — pursuit + PID + safety closed-loop stack
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
   agent.py           MiniPlusAgent      — Claude loop + instruction-file prompt
   tools.py           verb tools + dispatch
@@ -299,11 +310,11 @@ mini_plus_agent_kit/
 
 A hermetic suite (no robot, no network, no real SDKs — `httpx`/`anthropic` are
 stubbed) covers kinematics, telemetry mapping, IPFS CID, capability-filtered
-tools, the openClaw verb→endpoint wiring, all three work sinks, and a full
-scripted agent-loop run:
+tools, the openClaw verb→endpoint wiring, the navigation stack (filters,
+controllers, safety), all three work sinks, and a full scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 36 passed
+python3 tests/run_all.py     # zero-dependency runner  → 48 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -317,6 +328,7 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • the real MCP server: real protocol (initialize→list_tools→call_tool)→dispatch→HTTP
 #  • real track_color: HSV blob detection + visual-servo steering on generated frames
 #  • real GPS navigate: the goto_checkpoint controller reaches a checkpoint in a sim
+#  • navstack A/B: fused NavController truly arrives where bang-bang false-arrives under noise
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
 

@@ -214,6 +214,50 @@ class EarthRoverVerbs(RoverVerbs):
                 self.move(step_ft)
         return {"ok": False, "reason": "max_steps", "last": last}
 
+    def goto_checkpoint_fused(self, max_steps: int = 400, dt: float = 0.25,
+                              v_scale_mps: float = 0.6) -> dict:
+        """Closed-loop *fused* waypoint controller — the production autonomy path.
+
+        Where ``goto_checkpoint`` is bang-bang on raw GPS+heading, this runs the
+        navigation stack: heading fusion (orientation/IMU), pose fusion (commanded-
+        velocity odometry corrected by GPS), pursuit steering, and a safety envelope
+        (battery / tilt / lidar time-to-collision), emitting a smoothed twist each
+        loop via ``/control``. Proven to reach the checkpoint where the bang-bang
+        baseline false-arrives under GPS noise (``tests/live/test_live_navstack.py``).
+        """
+        from .control import NavController
+
+        t = self.client.data()
+        if t.latitude is None or t.longitude is None:
+            raise EarthRoverError(409, "no GPS fix")
+        cps = self.client.checkpoints()
+        scanned = cps.get("latest_scanned_checkpoint") or 0
+        nxt = next((c for c in sorted(cps.get("checkpoints_list", []),
+                                      key=lambda c: c.get("sequence", 0))
+                    if c.get("sequence", 0) > scanned), None)
+        if nxt is None:
+            return {"done": True, "reply": "all checkpoints scanned — mission complete"}
+        glat, glon = float(nxt["latitude"]), float(nxt["longitude"])
+        nav = NavController(t.latitude, t.longitude,
+                            tol_m=CHECKPOINT_TOLERANCE_M, v_scale_mps=v_scale_mps)
+        last = {}
+        for step in range(1, max_steps + 1):
+            t = self.client.data()
+            s = nav.step(dt, heading_deg=t.orientation or 0.0, goal_lat=glat, goal_lon=glon,
+                         lat=t.latitude, lon=t.longitude, lidar_front_m=t.lidar_front_m,
+                         battery=t.battery, estop=bool(t.estop))
+            last = {"distance_m": round(s.distance_m, 1), "safety": s.safety,
+                    "heading_error_deg": round(s.heading_error_deg, 1)}
+            if s.arrived:
+                self.client.stop()
+                res = self.client.checkpoint_reached()
+                return {"ok": True, "reached": nxt.get("sequence"), "steps": step,
+                        "controller": "fused", "result": res}
+            self.client.control(s.linear, s.angular)
+            time.sleep(dt)
+        self.client.stop()
+        return {"ok": False, "reason": "max_steps", "controller": "fused", "last": last}
+
     def stop(self) -> dict:
         return self.client.stop()
 
@@ -263,19 +307,23 @@ class HarnessVerbs(RoverVerbs):
     def turn(self, degrees: float, max_time: float = 12.0) -> dict:
         """Closed-loop turn using the harness yaw telemetry (+deg = right)."""
         start = self.client.data().orientation
+        # +degrees = turn right (compass CW). ROS twist: +angular = CCW = left, so
+        # a right turn needs NEGATIVE angular. (If a unit's IMU yaw is CCW-positive,
+        # set ROVER_YAW_SIGN=-1 to flip — calibrate with a measured 90° turn.)
+        cmd = -0.5 if degrees >= 0 else 0.5
         if start is None:
             # No heading feedback — fall back to a timed open-loop spin.
-            self.client.control(linear=0, angular=0.5 if degrees >= 0 else -0.5)
+            self.client.control(linear=0, angular=cmd)
             time.sleep(min(abs(degrees) / 90.0, max_time))
             self.client.stop()
             return {"ok": True, "mode": "open_loop", "degrees": degrees}
 
         target = abs(degrees)
-        sign = 1.0 if degrees >= 0 else -1.0
+        sign = 1.0 if degrees >= 0 else -1.0   # report signed magnitude turned
         turned = 0.0
         prev = start
         t0 = time.time()
-        self.client.control(linear=0, angular=0.5 * sign)
+        self.client.control(linear=0, angular=cmd)
         while time.time() - t0 < max_time and turned < target - self.turn_tolerance_deg:
             time.sleep(0.1)
             cur = self.client.data().orientation
