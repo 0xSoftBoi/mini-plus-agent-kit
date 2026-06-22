@@ -14,6 +14,9 @@ It's built on the three real specs in the BitRobot ecosystem, not bespoke glue:
 
 ## Architecture
 
+> 📐 Full system architecture with 13 validated diagrams, control equations, and
+> the capability matrix: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
 ```
             instruction files (AGENTS/SOUL/IDENTITY/TOOLS) ── compose ──► system prompt
                                                                               │
