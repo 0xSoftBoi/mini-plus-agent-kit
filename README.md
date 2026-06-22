@@ -39,6 +39,85 @@ It's built on the three real specs in the BitRobot ecosystem, not bespoke glue:
 
 One agent, two robots (swap the client), one artifact, two ledgers.
 
+```mermaid
+flowchart TB
+  subgraph FE["Front-ends (clients)"]
+    AG["MiniPlusAgent<br/>Claude tool-use loop"]
+    CH["RoverChat / TelegramBridge"]
+    MC["MCP server<br/>any MCP client"]
+  end
+  subgraph CORE["Verb core — single source of truth"]
+    REG["VERBS registry<br/>name · cap · schema · handler"]
+    MT["make_tools(caps, has_work)"]
+    DP["dispatch(verbs, name, args)"]
+    REG --> MT
+    REG --> DP
+  end
+  subgraph VB["RoverVerbs — openClaw verb surface"]
+    ER["EarthRoverVerbs"]
+    HV["HarnessVerbs"]
+  end
+  subgraph TR["Transports"]
+    EC["EarthRoverClient<br/>FrodoBots SDK"]
+    HC["HarnessClient<br/>robot-harness"]
+  end
+  subgraph WK["Work layer"]
+    WS["WorkSink"]
+    BR["BitRobotSink"]
+    OR["OnchainRoverSink"]
+    RP["RaceProofSink"]
+    WS --- BR
+    WS --- OR
+    WS --- RP
+  end
+  AG --> MT
+  CH --> MT
+  MC --> MT
+  AG --> DP
+  CH --> DP
+  MC --> DP
+  DP --> ER
+  DP --> HV
+  ER --> EC --> MINI["EarthRover Mini+"]
+  HV --> HC --> UGV["Waveshare UGV"]
+  DP -. capture_work .-> WS
+```
+
+**GPS waypoint navigation** (Earth Rover Challenge — Urban track):
+
+```mermaid
+flowchart TD
+  S["goto_checkpoint()"] --> N["navigate(): GPS + heading,<br/>next un-scanned checkpoint"]
+  N --> D{all checkpoints<br/>scanned?}
+  D -- yes --> OK["mission complete"]
+  D -- no --> T{distance &le; 15 m?}
+  T -- yes --> CR["checkpoint_reached()"]
+  CR --> N
+  T -- no --> H{abs heading_error<br/>&gt; 18&deg;?}
+  H -- yes --> TU["turn(heading_error)"]
+  H -- no --> MV["move(forward)"]
+  TU --> N
+  MV --> N
+```
+
+**Verifiable Robotic Work** — one content-addressed artifact, multiple ledgers:
+
+```mermaid
+flowchart TB
+  CAP["capture_work / submit_work"] --> ART["store_artifact:<br/>Walrus blobId + IPFS CIDv1 + sha256"]
+  ART --> MS["MultiSink (one artifact, many ledgers)"]
+  MS --> BR["BitRobotSink"]
+  MS --> OR["OnchainRoverSink"]
+  MS --> RP["RaceProofSink"]
+  BR --> E1["POST /subnets/{id}/events<br/>VRW points &rarr; Bolts"]
+  OR --> E2["POST /proof + /give-feedback<br/>settle.giveFeedback &rarr; Arc"]
+  RP --> E3["POST /race/settle<br/>settle.settleRaceOnChain &rarr; Arc"]
+```
+
+More figures (agent loop, kinematics, visual servo, VRW lifecycle, Waveshare
+command stack, module graph, end-to-end, tests) in
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
 ## Why verbs, not raw control
 
 The openClaw kit's key lesson: an agent should drive through **safe, high-level
