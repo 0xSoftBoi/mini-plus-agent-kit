@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-plus-agent-kit"
+version = "0.1.0"
+description = "Drive the BitRobot Earth Rover Mini+ with Claude (Earth Rovers SDK + agent loop)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "anthropic>=0.69",
+    "httpx>=0.27",
+]
+
+[project.urls]
+"BitRobot Mini+ Agent Kit" = "https://bitrobot.ai/miniplusagentkit"
+"Earth Rovers SDK" = "https://github.com/frodobots-org/earth-rovers-sdk"
+
+[project.optional-dependencies]
+lerobot = ["lerobot", "opencv-python", "numpy"]
+vision = ["google-genai"]
+track = ["Pillow", "numpy"]
+mcp = ["mcp"]
+
+[project.scripts]
+mpak = "mini_plus_agent_kit.cli:main"
+
+[tool.setuptools]
+packages = ["mini_plus_agent_kit"]
+
+[tool.setuptools.package-data]
+mini_plus_agent_kit = ["instructions/*.md"]
