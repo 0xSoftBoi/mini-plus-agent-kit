@@ -43,3 +43,18 @@ def heading_error_deg(current_heading: float, target_bearing: float) -> float:
     Matches the kit's ``turn`` convention (+degrees = right).
     """
     return (target_bearing - current_heading + 540.0) % 360.0 - 180.0
+
+
+def gps_course_and_speed(lat0: float, lon0: float, lat1: float, lon1: float,
+                         dt_s: float) -> tuple[float | None, float]:
+    """Course-over-ground (deg) and ground speed (m/s) between two GPS fixes.
+
+    Course is the bearing of actual motion — a magnetically-immune, drift-free
+    heading reference — but it is undefined when stationary, so it is returned as
+    ``None`` if the rover barely moved (< ~5 cm) between fixes. The caller speed-gates
+    the course before trusting it (GPS course is pure noise at very low speed).
+    """
+    d = haversine_m(lat0, lon0, lat1, lon1)
+    speed = d / dt_s if dt_s > 0 else 0.0
+    course = initial_bearing_deg(lat0, lon0, lat1, lon1) if d > 0.05 else None
+    return course, speed

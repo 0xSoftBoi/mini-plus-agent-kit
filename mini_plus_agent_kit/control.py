@@ -17,7 +17,7 @@ import math
 from dataclasses import dataclass
 
 from .estimator import HeadingFilter, PoseFilter
-from .geo import heading_error_deg
+from .geo import heading_error_deg, gps_course_and_speed
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -393,6 +393,10 @@ class NavController:
         self.v_scale_mps = v_scale_mps
         self._last_v = 0.0
         self._last_w = 0.0
+        self._prev_acc: tuple[float, float] | None = None   # last KF-accepted GPS fix
+        self._t_acc = 0.0                                    # time since that accepted fix
+        self._pending_course: float | None = None           # course for next heading update
+        self._pending_speed = 0.0
 
     def set_path(self, path_xy: list) -> None:
         """Track this planned ENU path (from ``planner.plan_path``) with regulated pure pursuit."""
@@ -406,14 +410,31 @@ class NavController:
              battery: float | None = None, roll: float | None = None,
              pitch: float | None = None, lidar_front_m: float | None = None,
              estop: bool = False, obstacles: list | None = None) -> NavStep:
-        hhat = self.hf.update(dt, gyro_z_dps=yaw_rate_dps or 0.0, absolute_deg=heading_deg)
+        # heading: predict on gyro, correct toward mag + (speed-gated) GPS course.
+        # The course was derived last step from KF-accepted fixes only (see below).
+        hhat = self.hf.update(dt, gyro_z_dps=yaw_rate_dps or 0.0, absolute_deg=heading_deg,
+                              course_deg=self._pending_course, speed_mps=self._pending_speed)
+        self._pending_course, self._pending_speed = None, 0.0
         # dead-reckon: measured wheel odometry if given, else commanded-velocity proxy
         if ds_m is None:
             ds_m = self.v_scale_mps * self._last_v * dt
         self.pf.predict(ds_m, hhat)
         gps_rejected = False
+        self._t_acc += dt
         if lat is not None and lon is not None:
-            gps_rejected = not self.pf.correct_gps(lat, lon)
+            accepted = self.pf.correct_gps(lat, lon)
+            gps_rejected = not accepted
+            if accepted:
+                # course-over-ground from consecutive *accepted* fixes (multipath is
+                # already gated out), and only when the displacement clears the GPS
+                # noise — else position-differenced course is noise, not signal.
+                if self._prev_acc is not None:
+                    c, sp = gps_course_and_speed(self._prev_acc[0], self._prev_acc[1],
+                                                 lat, lon, self._t_acc)
+                    if c is not None and sp * self._t_acc > 6.0 * math.sqrt(self.pf.R):
+                        self._pending_course, self._pending_speed = c, sp
+                self._prev_acc = (lat, lon)
+                self._t_acc = 0.0
         x, y = self.pf.xy()
         gx, gy = self.pf.to_xy(goal_lat, goal_lon)
         if self.path and self.rpp is not None:               # track the planned path

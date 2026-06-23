@@ -13,6 +13,7 @@ echo "== live: mcp (real protocol → dispatch) ==";   .venv/bin/python tests/li
 echo "== live: track_color (real HSV visual servo) =="; .venv/bin/python tests/live/test_live_track_color.py
 echo "== live: navigate (real GPS waypoint controller) =="; .venv/bin/python tests/live/test_live_navigate.py
 echo "== live: navstack (fused estimator+pursuit vs bang-bang, noisy sim) =="; .venv/bin/python tests/live/test_live_navstack.py
+echo "== live: heading (GPS-course fusion rescues a biased magnetometer) =="; .venv/bin/python tests/live/test_live_heading.py
 echo "== live: planner (A* + regulated pursuit routes around obstacle) =="; .venv/bin/python tests/live/test_live_planner.py
 echo "== live: dwa (dynamic-window local planner avoids moving obstacle) =="; .venv/bin/python tests/live/test_live_dwa.py
 echo "== live: walrus (real testnet) ==";            .venv/bin/python tests/live/test_live_walrus.py

@@ -288,12 +288,19 @@ SDK), with real GPS waypoint navigation:
   pedestrian crosses the corridor: plain pursuit closes to 0.16 m (collision) while
   DWA holds 2.87 m clearance and still reaches the goal.
   See [§7.3](docs/ARCHITECTURE.md#73-local-obstacle-avoidance-the-dynamic-window-approach).
+- **Estimator refinements** ([§7.4](docs/ARCHITECTURE.md#74-estimator-refinements-course-fusion-mag-calibration-full-covariance)):
+  speed-gated **GPS-course fusion** (down-weights a magnetically-disturbed compass —
+  cuts heading RMSE 24.9° → 10.4° under a 25° hard-iron bias), **magnetometer
+  hard/soft-iron calibration** (`MagnetometerCalibrator`, ellipsoid → sphere), and a
+  full **2×2 covariance** pose filter with anisotropic process noise + GPS-latency
+  rewind.
 
 The live tests drive a 2D kinematic rover sim over real HTTP to a GPS checkpoint
 (`tests/live/test_live_navigate.py`), run the fused-vs-baseline A/B under sensor
-noise + GPS multipath (`tests/live/test_live_navstack.py`), route around an obstacle
-with A\* + regulated pursuit (`tests/live/test_live_planner.py`), and dodge a moving
-pedestrian with DWA (`tests/live/test_live_dwa.py`).
+noise + GPS multipath (`tests/live/test_live_navstack.py`), rescue a biased
+magnetometer with GPS-course fusion (`tests/live/test_live_heading.py`), route around
+an obstacle with A\* + regulated pursuit (`tests/live/test_live_planner.py`), and
+dodge a moving pedestrian with DWA (`tests/live/test_live_dwa.py`).
 
 ## Waveshare as a LeRobot robot
 
@@ -312,7 +319,7 @@ mini_plus_agent_kit/
   client.py          EarthRoverClient   — FrodoBots SDK transport (+ openClaw verbs)
   harness_client.py  HarnessClient      — Waveshare robot-harness transport
   rover.py           RoverVerbs         — openClaw verb surface (2 backends)
-  estimator.py       HeadingFilter/PoseFilter — Mahony heading + Kalman GPS pose fusion
+  estimator.py       HeadingFilter/PoseFilter/MagnetometerCalibrator — heading+pose fusion, mag cal
   control.py         NavController       — pursuit + RPP + DWA + PID + safety stack
   planner.py         Costmap + A*        — global path planning around obstacles
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
@@ -334,7 +341,7 @@ controllers, safety, costmap + A* planner), all three work sinks, and a full
 scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 56 passed
+python3 tests/run_all.py     # zero-dependency runner  → 60 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -350,6 +357,7 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • real GPS navigate: the goto_checkpoint controller reaches a checkpoint in a sim
 #  • navstack A/B: fused NavController (Kalman + Mahalanobis gating) truly arrives and rejects
 #    GPS multipath where the bang-bang baseline false-arrives 34.6 m out
+#  • heading: speed-gated GPS-course fusion rescues a 25°-biased magnetometer (24.9°→10.4°)
 #  • planner: A* over a costmap + regulated pure pursuit routes around a building (0 incursions)
 #  • dwa: dynamic-window local planner steers around a moving pedestrian (holds clearance, arrives)
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1

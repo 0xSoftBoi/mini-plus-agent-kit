@@ -417,6 +417,42 @@ an `obstacles` list, it is the reactive avoidance layer beneath the global plan 
 together giving the Nav2 trio: global A\* path, regulated-pursuit tracking, and
 dynamic-window local avoidance.
 
+### 7.4 Estimator refinements: course fusion, mag calibration, full covariance
+
+Three production-grade refinements harden the estimator against real sensor
+pathologies:
+
+**(a) Speed-gated GPS-course fusion (`HeadingFilter`).** A magnetometer suffers local
+magnetic disturbance (a steel railing, the rover's own motors); GPS
+*course-over-ground* is magnetically immune and drift-free, but undefined at rest and
+noise-dominated at low speed (unreliable below ~1 km/h). The filter fuses course as a
+second absolute — gated and ramped by speed — and, when course is confident,
+**down-weights the magnetometer** (it may be the disturbed source). Course is derived
+*only* from Kalman-accepted fixes (so multipath never feeds heading) and only when the
+inter-fix displacement clears the GPS noise (else position-differenced course is noise,
+not signal — real receivers use Doppler velocity). Validated
+(`tests/live/test_live_heading.py`): under a 25° hard-iron magnetometer bias, course
+fusion cuts heading RMSE **24.9° → 10.4° (2.4×)**.
+
+**(b) Magnetometer hard/soft-iron calibration (`MagnetometerCalibrator`).** Raw
+readings trace an off-centre ellipsoid, not a sphere — hard-iron shifts the centre,
+soft-iron scales the axes. Min/max calibration over a yaw rotation recovers the offset
+$b_i=(\max_i+\min_i)/2$ and diagonal scale $s_i=\bar r/r_i$; calibrated
+$m_i'=s_i\,(m_i-b_i)$. Validated: on a synthetic ellipsoid (offset + 1.6/0.7 axis
+scale) calibration cuts heading RMSE **>5×, to under 2°**.
+
+**(c) Full 2×2 covariance + GPS latency (`PoseFilter`).** The pose filter carries the
+complete covariance $P=\begin{pmatrix}p_{xx}&p_{xy}\\p_{xy}&p_{yy}\end{pmatrix}$ and
+grows it with **anisotropic** process noise — more uncertainty *along* the heading than
+across it (wheel slip/scale error accumulate along travel) — so the Mahalanobis gate
+$d^2=\nu^\top S^{-1}\nu$ uses the true innovation covariance. A delayed fix (telemetry
+latency) is fused against the pose it actually describes — rewound ``age_steps`` in a
+short displacement buffer — not the current pose.
+
+These complete the estimator; remaining hardening (full off-diagonal soft-iron via
+ellipsoid least-squares, Doppler-velocity course, per-fix timestamping) needs
+on-hardware data to tune and validate.
+
 ---
 
 ## 8. Visual servoing: `track_color`
@@ -585,18 +621,19 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 56 tests (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack · planner"]
+  subgraph H["Hermetic suite &mdash; 60 tests (stubbed httpx / anthropic)"]
+    HU["units · geo · registry · verbs · work · tools · agent-loop<br/>mcp · telegram · actuators · navstack · planner · estimator refinements"]
   end
-  subgraph L["Live suite &mdash; 8 tests (real I/O, no stubs)"]
+  subgraph L["Live suite &mdash; 9 tests (real I/O, no stubs)"]
     L1["harness: real httpx &harr; HTTP emulator"]
     L2["mcp: real protocol &harr; dispatch"]
     L3["track_color: real HSV on generated JPEG"]
     L4["navigate: real geo &harr; kinematic sim"]
     L5["navstack: fused vs bang-bang, noisy sim"]
-    L6["planner: A* + reg. pursuit around obstacle"]
-    L7["dwa: local avoidance of a moving obstacle"]
-    L8["walrus: real testnet store + retrieve"]
+    L6["heading: GPS-course rescues biased mag"]
+    L7["planner: A* + reg. pursuit around obstacle"]
+    L8["dwa: local avoidance of a moving obstacle"]
+    L9["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
@@ -608,6 +645,7 @@ flowchart TB
 | track_color | real HSV detection + servo on real generated JPEGs (right-blob → turn-right; arrival stop) |
 | navigate | real geo + the `goto_checkpoint` controller converging to a checkpoint (65 m → 9 m) in a 2-D kinematic sim |
 | navstack | fused `NavController` (Kalman pose filter + Mahalanobis gating) vs bang-bang baseline on the same noisy truth incl. GPS multipath: baseline false-arrives 34.6 m out; fused gates every outlier, arrives truly (14.9 m), heading 2.2× better than raw mag |
+| heading | speed-gated GPS-course fusion vs mag-only `HeadingFilter` under a 25° hard-iron bias: course fusion cuts heading RMSE 24.9° → 10.4° (2.4×) |
 | planner | A\* over an inflated costmap + regulated pure pursuit vs straight-line seeking: naive drives through a building (46 ticks inside); planned route (69 m vs 60 m straight) reaches the goal with 0 incursions |
 | dwa | Dynamic Window Approach vs plain pursuit with a *moving* pedestrian: pursuit closes to 0.16 m (collision); DWA holds 2.87 m clearance and still reaches the goal |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
@@ -638,6 +676,7 @@ mission; the kit provides the policy.
 - Earth Rover Challenge — `earth-rover-challenge.github.io` (IROS 2026).
 - Waveshare ESP32 firmware — `waveshareteam/ugv_base_general` (see `WAVESHARE_PROTOCOL.md`).
 - Mahony PI complementary attitude filter — `ahrs.readthedocs.io/en/latest/filters/mahony.html` (heading + gyro-bias, §7.1).
-- `robot_localization` dual-EKF + navsat_transform — ROS GPS/IMU/odometry fusion (§7.1 Kalman pose).
+- `robot_localization` dual-EKF + navsat_transform — ROS GPS/IMU/odometry fusion (§7.1 Kalman pose, §7.4 course fusion).
+- Magnetometer hard/soft-iron calibration (min/max & ellipsoid-fit methods) (§7.4).
 - [RPP] Macenski et al., *Regulated Pure Pursuit for Robot Path Tracking*, arXiv:2305.20026; Nav2 `regulated_pure_pursuit` (§7.2).
 - [DWA] Fox, Burgard & Thrun, *The Dynamic Window Approach to Collision Avoidance*, IEEE R&A 1997 (§7.3).

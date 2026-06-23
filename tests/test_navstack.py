@@ -4,7 +4,10 @@ import _bootstrap  # noqa: F401
 
 import math
 
-from mini_plus_agent_kit.estimator import HeadingFilter, PoseFilter, mag_heading_deg
+from mini_plus_agent_kit.estimator import (
+    HeadingFilter, PoseFilter, mag_heading_deg, MagnetometerCalibrator,
+)
+from mini_plus_agent_kit.geo import gps_course_and_speed
 from mini_plus_agent_kit.control import (
     HeadingPID, PursuitController, DistanceController, SafetyEnvelope, SafetyLimits,
     NavController, DWAPlanner,
@@ -67,10 +70,10 @@ def test_safety_envelope():
 def test_posefilter_kalman_gain_and_outlier_gate():
     base_lat, base_lon = 37.87, -122.25
     pf = PoseFilter(base_lat, base_lon, sigma_gps_m=4.0, p0=25.0)
-    p_start = pf.P
+    p_start = pf.position_variance()
     # a good fix at the origin is accepted and shrinks the covariance (optimal gain)
     assert pf.correct_gps(base_lat, base_lon) is True
-    assert pf.P < p_start and not pf.last_rejected
+    assert pf.position_variance() < p_start and not pf.last_rejected
     # consistent fixes while driving north keep the estimate locked on truth
     for _ in range(10):
         pf.predict(1.0, 0.0)                       # +1 m north (grows P a touch)
@@ -143,6 +146,74 @@ def test_dwa_rounds_a_static_obstacle_closed_loop():
 def test_mag_heading():
     assert abs(heading_error_deg(mag_heading_deg(0.0, 1.0), 0.0)) < 1e-6    # +y → North
     assert abs(heading_error_deg(mag_heading_deg(1.0, 0.0), 90.0)) < 1e-6   # +x → East
+
+
+def test_heading_filter_gps_course_overrides_biased_mag():
+    # magnetometer has a 25 deg hard-iron bias; GPS course is true once moving
+    true_hdg = 40.0
+    f = HeadingFilter()
+    for _ in range(200):
+        f.update(0.2, gyro_z_dps=0.0, absolute_deg=true_hdg + 25.0,
+                 course_deg=true_hdg, speed_mps=1.5)
+    assert abs(heading_error_deg(f.heading, true_hdg)) < 12.0   # pulled off the biased mag
+    # below the speed gate, course is ignored (stays on the biased mag)
+    g = HeadingFilter()
+    for _ in range(200):
+        g.update(0.2, gyro_z_dps=0.0, absolute_deg=true_hdg + 25.0,
+                 course_deg=true_hdg, speed_mps=0.1)
+    assert abs(heading_error_deg(g.heading, true_hdg + 25.0)) < 3.0   # converged to mag
+
+
+def test_gps_course_and_speed():
+    # ~one second moving due north at ~1 m/s
+    c, v = gps_course_and_speed(37.0, -122.0, 37.0 + 1.0 / 111_320.0, -122.0, 1.0)
+    assert abs(heading_error_deg(c, 0.0)) < 1.0 and 0.9 < v < 1.1
+    c0, v0 = gps_course_and_speed(37.0, -122.0, 37.0, -122.0, 1.0)   # stationary
+    assert c0 is None and v0 < 0.01
+
+
+def test_magnetometer_calibration_recovers_heading():
+    import math as _m
+    bias = (0.4, -0.3, 0.1)            # hard-iron offset
+    sx, sy, sz = 1.6, 0.7, 1.0         # soft-iron per-axis scale (ellipsoid)
+    cal = MagnetometerCalibrator()
+    raw_err = cal_err = 0.0
+    headings = [h * 1.0 for h in range(0, 360, 5)]
+    for h in headings:
+        r = _m.radians(h)
+        mx = sx * _m.sin(r) + bias[0]
+        my = sy * _m.cos(r) + bias[1]
+        mz = sz * 0.2 + bias[2]
+        cal.add(mx, my, mz)
+    cal.fit()
+    for h in headings:
+        r = _m.radians(h)
+        mx = sx * _m.sin(r) + bias[0]
+        my = sy * _m.cos(r) + bias[1]
+        raw_err += heading_error_deg(mag_heading_deg(mx, my), h) ** 2
+        cal_err += heading_error_deg(cal.heading_deg(mx, my, sz * 0.2 + bias[2]), h) ** 2
+    raw_rmse = math.sqrt(raw_err / len(headings))
+    cal_rmse = math.sqrt(cal_err / len(headings))
+    assert cal_rmse < 2.0 and cal_rmse < raw_rmse * 0.2   # calibration removes the distortion
+
+
+def test_posefilter_anisotropic_covariance_and_latency():
+    pf = PoseFilter(37.0, -122.0, sigma_gps_m=3.0)
+    for _ in range(10):
+        pf.predict(1.0, 0.0)           # drive north → uncertainty grows along North (y)
+    assert pf.pyy > pf.pxx             # anisotropic: along-track > cross-track
+    # latency: a fix describing the pose 5 steps ago must be fused there, not here
+    pf2 = PoseFilter(37.0, -122.0, sigma_gps_m=1.0, p0=4.0)
+    for _ in range(10):
+        pf2.predict(1.0, 0.0)          # truly at ~ (0,10)
+    delayed = pf2.latlon()             # pretend the fix is from 5 steps ago...
+    five_ago = (37.0 + 5.0 / 111_320.0, -122.0)
+    naive = PoseFilter(37.0, -122.0, sigma_gps_m=1.0, p0=4.0)
+    for _ in range(10):
+        naive.predict(1.0, 0.0)
+    naive.correct_gps(*five_ago)                       # applied as if current → drags back
+    pf2.correct_gps(*five_ago, age_steps=5)            # applied at the right pose
+    assert pf2.xy()[1] > naive.xy()[1]                 # latency-aware stays closer to truth
 
 
 if __name__ == "__main__":
