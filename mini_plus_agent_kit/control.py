@@ -181,6 +181,7 @@ class NavStep:
     safety: str              # safety reason (e.g. "clear", "slow: TTC 2.1s")
     est_lat: float
     est_lon: float
+    gps_rejected: bool = False   # this step's GPS fix was Mahalanobis-gated (outlier)
 
 
 class NavController:
@@ -217,8 +218,9 @@ class NavController:
         if ds_m is None:
             ds_m = self.v_scale_mps * self._last_v * dt
         self.pf.predict(ds_m, hhat)
+        gps_rejected = False
         if lat is not None and lon is not None:
-            self.pf.correct_gps(lat, lon)
+            gps_rejected = not self.pf.correct_gps(lat, lon)
         x, y = self.pf.xy()
         gx, gy = self.pf.to_xy(goal_lat, goal_lon)
         cmd = self.pp.step(x, y, hhat, gx, gy)
@@ -229,4 +231,5 @@ class NavController:
         self._last_v = linear
         est_lat, est_lon = self.pf.latlon()
         return NavStep(linear, angular, cmd.distance_m, cmd.heading_error_deg,
-                       cmd.arrived, verdict.ok, verdict.reason, est_lat, est_lon)
+                       cmd.arrived, verdict.ok, verdict.reason, est_lat, est_lon,
+                       gps_rejected)

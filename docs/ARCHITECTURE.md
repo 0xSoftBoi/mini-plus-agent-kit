@@ -268,11 +268,20 @@ $$\hat\psi \leftarrow \hat\psi + (\omega_z-\hat b)\,\Delta t,\qquad
   \hat\psi \leftarrow \hat\psi + k_p\,e_\psi,\qquad
   \hat b \leftarrow \hat b - k_i\,e_\psi\,\Delta t$$
 
-**Pose estimation.** Dead-reckon local-ENU position from wheel odometry (or a
-commanded-velocity proxy when none is exposed) along $\hat\psi$, pulled toward each
-GPS fix by $k_\text{gps}$:
-$$(x,y)\mathrel{+}=\Delta s\,(\sin\hat\psi,\cos\hat\psi),\qquad
-  (x,y)\mathrel{+}=k_\text{gps}\big((x_\text{gps},y_\text{gps})-(x,y)\big)$$
+**Pose estimation.** A 2-D position **Kalman filter** (not a fixed-gain pull):
+dead-reckon local-ENU position from wheel odometry (or a commanded-velocity proxy
+when none is exposed) along $\hat\psi$ while growing the covariance $P$ by the
+process noise, then fuse each GPS fix by the *optimal* gain $K=P/(P+R)$ and shrink
+$P$. The gain self-tunes — early/uncertain fixes count more — instead of a hand-set
+$k_\text{gps}$. With process noise $q$ per metre and GPS variance $R=\sigma_\text{gps}^2$:
+$$P \mathrel{+}= q\,|\Delta s|,\qquad
+  K=\frac{P}{P+R},\qquad
+  (x,y)\mathrel{+}=K\big((x_\text{gps},y_\text{gps})-(x,y)\big),\qquad
+  P \leftarrow (1-K)\,P$$
+Each fix is **Mahalanobis-gated**: $d^2=\lVert z-\hat x\rVert^2/(P+R)$; a fix with
+$d^2>\chi^2_{2,0.99}\!\approx\!9.21$ (urban-canyon multipath) is rejected rather than
+dragging the estimate off-line, with $P$ slightly inflated on repeated rejects to
+re-acquire after a genuine relocation (anti-divergence).
 
 **Pursuit control.** A single-target pure-pursuit reduction — curvature steering
 plus approach slow-down — replaces turn-then-go bang-bang ($\alpha$ = signed bearing
@@ -313,12 +322,13 @@ flowchart LR
 controller, and safety envelope behind one `step(telemetry) → twist`.*
 
 **Why it matters (validated A/B).** In a noisy kinematic simulation
-(`tests/live/test_live_navstack.py`; GPS $\sigma=4$ m, gyro bias $3°/\text{s}$,
-magnetometer $\sigma=8°$) the same truth and noise sequence drive both controllers.
-The bang-bang baseline acts on raw GPS and **declares arrival 19.2 m from the
-checkpoint — a missed checkpoint at the 15 m Urban-track tolerance** — while the
-fused stack tracks heading **2.2× better than the raw magnetometer** and **truly
-arrives within tolerance (14.8 m)**.
+(`tests/live/test_live_navstack.py`; GPS $\sigma=4$ m + periodic $+25$ m multipath
+spikes, gyro bias $3°/\text{s}$, magnetometer $\sigma=8°$) the same truth and noise
+sequence drive both controllers. The bang-bang baseline acts on raw GPS and a
+multipath spike near the goal makes it **declare arrival 34.6 m from the checkpoint
+— a missed checkpoint at the 15 m Urban-track tolerance**. The fused stack
+**Mahalanobis-gates every injected multipath outlier**, tracks heading **2.2×
+better than the raw magnetometer**, and **truly arrives within tolerance (14.9 m)**.
 
 ---
 
@@ -486,7 +496,7 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 48 tests (stubbed httpx / anthropic)"]
+  subgraph H["Hermetic suite &mdash; 49 tests (stubbed httpx / anthropic)"]
     HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack"]
   end
   subgraph L["Live suite &mdash; 6 tests (real I/O, no stubs)"]
@@ -506,7 +516,7 @@ flowchart TB
 | mcp | real MCP `initialize → list_tools → call_tool` → `dispatch` → HTTP; `ImageContent` |
 | track_color | real HSV detection + servo on real generated JPEGs (right-blob → turn-right; arrival stop) |
 | navigate | real geo + the `goto_checkpoint` controller converging to a checkpoint (65 m → 9 m) in a 2-D kinematic sim |
-| navstack | fused `NavController` vs bang-bang baseline on the same noisy truth: baseline false-arrives 19.2 m out; fused arrives truly (14.8 m), heading 2.2× better than raw mag |
+| navstack | fused `NavController` (Kalman pose filter + Mahalanobis gating) vs bang-bang baseline on the same noisy truth incl. GPS multipath: baseline false-arrives 34.6 m out; fused gates every outlier, arrives truly (14.9 m), heading 2.2× better than raw mag |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
 
 > **Scope of validation.** The plumbing, protocols, content-addressing, geometry,

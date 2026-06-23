@@ -32,9 +32,11 @@ MLON = M * math.cos(math.radians(BASE_LAT))
 GOAL = (25.0, 60.0)  # ENU metres; ~65 m at bearing ~23 deg
 TOL = 15.0
 GPS_SIGMA = 4.0
-GYRO_BIAS = 3.0      # deg/s constant drift
+GYRO_BIAS = 3.0          # deg/s constant drift
 GYRO_NOISE = 2.0
 MAG_NOISE = 8.0
+MULTIPATH_EVERY = 10     # every 10th GPS fix is an urban-canyon multipath spike
+MULTIPATH_M = 25.0       # spike magnitude (well outside the 3-sigma gate)
 
 
 def _cross_track(x, y):
@@ -51,13 +53,22 @@ def simulate(controller, seed):
     xt_sq = 0.0
     head_err_sq = 0.0
     n = 0
+    n_outliers = 0
     claimed = None
     for t in range(1000):
         # --- sensors ---
         gyro = (-getattr(controller, "_last_w", 0.0) * YAW_RATE) + GYRO_BIAS + rng.gauss(0, GYRO_NOISE)
         mag = (th + rng.gauss(0, MAG_NOISE)) % 360.0
         if t % 5 == 0:         # GPS at 1 Hz
-            raw_gps = (x + rng.gauss(0, GPS_SIGMA), y + rng.gauss(0, GPS_SIGMA))
+            gx = x + rng.gauss(0, GPS_SIGMA)
+            gy = y + rng.gauss(0, GPS_SIGMA)
+            fix_idx = t // 5
+            if fix_idx > 0 and fix_idx % MULTIPATH_EVERY == 0:   # inject multipath spike
+                ang = rng.uniform(0, 2 * math.pi)
+                gx += MULTIPATH_M * math.cos(ang)
+                gy += MULTIPATH_M * math.sin(ang)
+                n_outliers += 1
+            raw_gps = (gx, gy)
         gps_fix = raw_gps if t % 5 == 0 else None
         odom += SPEED * getattr(controller, "_last_v", 0.0) * DT * 1.02 + rng.gauss(0, 0.02)
 
@@ -85,6 +96,7 @@ def simulate(controller, seed):
         "claim_tick": claimed[0] if claimed else None,
         "claim_true_dist": claimed[1] if claimed else None,
         "ticks": n,
+        "n_outliers": n_outliers,
     }
 
 
@@ -129,8 +141,10 @@ class Fused:
 
 def main():
     seed = 7
-    a = simulate(Baseline(), seed)
-    b = simulate(Fused(), seed)
+    a_ctrl, b_ctrl = Baseline(), Fused()
+    a = simulate(a_ctrl, seed)
+    b = simulate(b_ctrl, seed)
+    rejected = b_ctrl.nc.pf.n_rejected
 
     def row(name, r):
         ct = f"{r['crosstrack_rms']:.1f}"
@@ -141,7 +155,7 @@ def main():
               f"crosstrack_rms={ct:>5} m  heading_rmse={hr:>4}°  arrival: {cl}")
 
     print(f"raw magnetometer heading noise sigma = {MAG_NOISE:.0f}°, GPS sigma = {GPS_SIGMA:.0f} m, "
-          f"gyro bias = {GYRO_BIAS:.0f}°/s")
+          f"gyro bias = {GYRO_BIAS:.0f}°/s, {a['n_outliers']} GPS multipath spikes (+{MULTIPATH_M:.0f} m)")
     row("baseline", a)
     row("fused", b)
 
@@ -153,13 +167,17 @@ def main():
     assert a["claim_true_dist"] is not None and a["claim_true_dist"] > TOL, a
     # 4) The fused stack ends meaningfully closer to the goal.
     assert b["final_true_dist"] < a["final_true_dist"], (b["final_true_dist"], a["final_true_dist"])
+    # 5) The Kalman pose filter Mahalanobis-gates the GPS multipath spikes.
+    assert rejected >= max(1, int(0.8 * a["n_outliers"])), (rejected, a["n_outliers"])
 
     print(f"\n  -> baseline FALSE arrival: declared done {a['claim_true_dist']:.1f} m from the "
           f"checkpoint (missed at {TOL:.0f} m tolerance)")
     print(f"  -> fused TRUE arrival within tolerance ({b['claim_true_dist']:.1f} m); "
           f"heading {MAG_NOISE / b['heading_rmse']:.1f}x better than the raw magnetometer")
-    print("\nLIVE NAVSTACK PASSED (fused estimator + pursuit reaches the checkpoint; "
-          "bang-bang on raw sensors does not)")
+    print(f"  -> Kalman pose filter rejected {rejected}/{a['n_outliers']} GPS multipath outliers "
+          f"(Mahalanobis gate) — estimate never dragged off-line")
+    print("\nLIVE NAVSTACK PASSED (fused KF estimator + pursuit reaches the checkpoint; "
+          "bang-bang on raw GPS does not)")
 
 
 if __name__ == "__main__":

@@ -59,38 +59,69 @@ class HeadingFilter:
 
 
 class PoseFilter:
-    """Dead-reckon local-ENU position from odometry+heading; correct toward GPS.
+    """2-D position Kalman filter: odometry-driven prediction + gated GPS updates.
 
-    Between GPS fixes the pose is propagated by forward odometry along the current
-    heading (loop rate); each GPS fix pulls the estimate toward the measurement by
-    ``k_gps`` (complementary correction). This yields a high-rate, smoothed pose
-    that rejects per-fix GPS noise while staying GPS-anchored (no odometry drift).
+    Proper Bayesian fusion, not a fixed-gain complementary pull. The estimate
+    carries a covariance ``P`` (isotropic scalar — GPS noise and the symmetric
+    process model are both ~isotropic) that **grows** with odometry process noise
+    on each ``predict`` and **shrinks** on each GPS update by the *optimal* Kalman
+    gain ``K = P/(P+R)`` — so early/uncertain fixes are trusted more and the gain
+    self-tunes instead of being hand-set. GPS fixes are **Mahalanobis-gated**: a fix
+    whose normalized innovation ``d² = ‖z−x‖²/(P+R)`` exceeds ``gate`` (urban-canyon
+    multipath, a momentary jump) is rejected rather than dragging the estimate
+    off-line; the gate is slowly opened on repeated rejects so a genuine relocation
+    is eventually accepted (anti-divergence).
 
-    Local ENU frame in metres about ``(base_lat, base_lon)``: x = East, y = North.
+    ``R`` = GPS measurement variance (σ_gps²); ``q_per_m`` = process variance added
+    per metre of odometry; ``gate`` ≈ χ²(2 DOF) threshold (9.21 ≈ 99%). Local-ENU
+    frame in metres about ``(base_lat, base_lon)``: x = East, y = North.
     """
 
-    def __init__(self, base_lat: float, base_lon: float, k_gps: float = 0.25):
+    def __init__(self, base_lat: float, base_lon: float, *, sigma_gps_m: float = 4.0,
+                 q_per_m: float = 0.05, gate: float = 9.21, p0: float = 25.0):
         self.base_lat = base_lat
         self.base_lon = base_lon
-        self.k_gps = k_gps
+        self.R = sigma_gps_m ** 2
+        self.q_per_m = q_per_m
+        self.gate = gate
         self.x = 0.0
         self.y = 0.0
+        self.P = p0
+        self.n_rejected = 0
+        self.last_rejected = False
         self._m_lon = _M_PER_DEG_LAT * math.cos(math.radians(base_lat))
 
     def predict(self, ds_m: float, heading_deg: float) -> None:
-        """Advance ``ds_m`` forward along ``heading_deg`` (0=N=+y, 90=E=+x)."""
+        """Advance ``ds_m`` forward along ``heading_deg`` (0=N=+y, 90=E=+x); grow P."""
         r = math.radians(heading_deg)
         self.x += ds_m * math.sin(r)
         self.y += ds_m * math.cos(r)
+        self.P += self.q_per_m * abs(ds_m) + 1e-6   # process-noise covariance growth
 
     def to_xy(self, lat: float, lon: float) -> tuple[float, float]:
         """Project an absolute lat/lon into this filter's local-ENU frame (metres)."""
         return ((lon - self.base_lon) * self._m_lon, (lat - self.base_lat) * _M_PER_DEG_LAT)
 
-    def correct_gps(self, lat: float, lon: float) -> None:
+    def correct_gps(self, lat: float, lon: float) -> bool:
+        """Fuse a GPS fix via the optimal Kalman gain; reject Mahalanobis outliers.
+
+        Returns ``True`` if the fix was accepted, ``False`` if gated out.
+        """
         gx, gy = self.to_xy(lat, lon)
-        self.x += self.k_gps * (gx - self.x)
-        self.y += self.k_gps * (gy - self.y)
+        ix, iy = gx - self.x, gy - self.y
+        s = self.P + self.R                          # innovation covariance
+        d2 = (ix * ix + iy * iy) / s                 # normalized innovation² (2 DOF)
+        if d2 > self.gate:                           # multipath / jump → reject
+            self.n_rejected += 1
+            self.last_rejected = True
+            self.P += 0.5 * self.R                   # open the gate a little (anti-divergence)
+            return False
+        k = self.P / s                               # optimal Kalman gain
+        self.x += k * ix
+        self.y += k * iy
+        self.P = (1.0 - k) * self.P
+        self.last_rejected = False
+        return True
 
     def xy(self) -> tuple[float, float]:
         return self.x, self.y

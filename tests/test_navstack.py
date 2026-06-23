@@ -64,6 +64,25 @@ def test_safety_envelope():
     assert s.check(0.5, battery=90, pitch=2, lidar_front_m=10).scale == 1.0         # clear
 
 
+def test_posefilter_kalman_gain_and_outlier_gate():
+    base_lat, base_lon = 37.87, -122.25
+    pf = PoseFilter(base_lat, base_lon, sigma_gps_m=4.0, p0=25.0)
+    p_start = pf.P
+    # a good fix at the origin is accepted and shrinks the covariance (optimal gain)
+    assert pf.correct_gps(base_lat, base_lon) is True
+    assert pf.P < p_start and not pf.last_rejected
+    # consistent fixes while driving north keep the estimate locked on truth
+    for _ in range(10):
+        pf.predict(1.0, 0.0)                       # +1 m north (grows P a touch)
+        lat, lon = pf.latlon()
+        assert pf.correct_gps(lat, lon) is True    # consistent → accepted
+    y_before = pf.xy()[1]
+    # a 25 m multipath spike is Mahalanobis-gated → rejected, estimate not dragged
+    assert pf.correct_gps(base_lat + 25.0 / 111_320.0, base_lon) is False
+    assert pf.last_rejected and pf.n_rejected == 1
+    assert abs(pf.xy()[1] - y_before) < 1.0        # barely moved despite the 25 m spike
+
+
 def test_navcontroller_converges_and_gates():
     base_lat, base_lon = 37.87, -122.25
     M = 111_320.0
