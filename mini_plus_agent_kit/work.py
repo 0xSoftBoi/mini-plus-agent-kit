@@ -44,6 +44,60 @@ WALRUS_AGGREGATOR = os.environ.get(
 )
 IPFS_CHUNK = 1 << 20  # 1 MiB — matches docs `--chunker=size-1048576`
 
+# Default attempts for bounded retry-with-backoff (see ``_retry``). One attempt
+# means single-shot (no retry); env override keeps it tunable in the field.
+WALRUS_PUT_ATTEMPTS = int(os.environ.get("WALRUS_PUT_ATTEMPTS", "3"))
+SIDECAR_POST_ATTEMPTS = int(os.environ.get("SIDECAR_POST_ATTEMPTS", "3"))
+RETRY_BACKOFF = float(os.environ.get("RETRY_BACKOFF", "0.5"))
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    """True for retryable transport failures (connect/timeout/read), not for an
+    HTTP error *response* (``raise_for_status`` → ``HTTPStatusError``).
+
+    ``httpx.RequestError`` is the base of every transport-level error; an HTTP
+    error status is a *definitive* answer from the server (e.g. a chain rejection
+    behind the sidecar) and must NOT be retried. Falls back gracefully when the
+    httpx stub lacks these classes.
+    """
+    status_err = getattr(httpx, "HTTPStatusError", None)
+    if status_err is not None and isinstance(exc, status_err):
+        return False
+    request_err = getattr(httpx, "RequestError", None)
+    if request_err is not None:
+        return isinstance(exc, request_err)
+    # Stub httpx without typed exceptions: treat anything not a status error as
+    # transport-level so the idempotent retry path still exercises.
+    return True
+
+
+def _retry(fn, *, attempts: int, backoff: float = RETRY_BACKOFF, sleep=time.sleep):
+    """Call ``fn`` up to ``attempts`` times, retrying only transport errors.
+
+    Backoff is exponential (``backoff * 2**i``). A non-transport error (HTTP
+    status / chain rejection) is re-raised immediately, never retried. The
+    success path returns ``fn()``'s value unchanged. ``sleep`` is injectable so
+    tests need not actually wait.
+    """
+    last: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - re-raised below
+            if not _is_transport_error(e) or i == attempts - 1:
+                raise
+            last = e
+            sleep(backoff * (2 ** i))
+    assert last is not None  # unreachable: loop either returns or raises
+    raise last
+
+
+def _post_json(url: str, payload: dict, timeout: float) -> dict:
+    """POST ``payload`` and return the decoded JSON body (raises on error status)."""
+    r = httpx.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
 
 # --------------------------------------------------------------------------- #
 # Content addressing
@@ -112,16 +166,27 @@ class Artifact:
         }
 
 
-def walrus_put(data: bytes, epochs: int = 5, timeout: float = 60.0) -> str:
-    """Store bytes on Walrus → blobId (handles both publisher response shapes)."""
-    r = httpx.put(
-        f"{WALRUS_PUBLISHER}/v1/blobs", params={"epochs": epochs}, content=data, timeout=timeout
-    )
-    r.raise_for_status()
-    j = r.json()
-    if "newlyCreated" in j:
-        return j["newlyCreated"]["blobObject"]["blobId"]
-    return j["alreadyCertified"]["blobId"]
+def walrus_put(
+    data: bytes, epochs: int = 5, timeout: float = 60.0, attempts: int = WALRUS_PUT_ATTEMPTS
+) -> str:
+    """Store bytes on Walrus → blobId (handles both publisher response shapes).
+
+    Idempotent: a re-PUT of already-stored bytes returns ``alreadyCertified``, so
+    transport failures are retried with bounded backoff (``attempts``). HTTP error
+    statuses are not retried. ``attempts=1`` is single-shot.
+    """
+
+    def _put() -> str:
+        r = httpx.put(
+            f"{WALRUS_PUBLISHER}/v1/blobs", params={"epochs": epochs}, content=data, timeout=timeout
+        )
+        r.raise_for_status()
+        j = r.json()
+        if "newlyCreated" in j:
+            return j["newlyCreated"]["blobObject"]["blobId"]
+        return j["alreadyCertified"]["blobId"]
+
+    return _retry(_put, attempts=attempts)
 
 
 def store_artifact(data: bytes, content_type: str = "image/jpeg") -> Artifact:
@@ -264,13 +329,20 @@ class OnchainRoverSink(WorkSink):
         score: int | None = None,
         anchor: bool = True,
         timeout: float = 30.0,
+        attempts: int = SIDECAR_POST_ATTEMPTS,
     ):
-        self.sidecar_url = (sidecar_url or os.environ.get("SIDECAR_URL", "http://localhost:4021")).rstrip("/")
+        # SIDECAR_URL collides with the Solana sidecar on port 4021, so prefer the
+        # Arc-specific ARC_SIDECAR_URL, then fall back to the shared SIDECAR_URL.
+        self.sidecar_url = (
+            sidecar_url or os.environ.get("ARC_SIDECAR_URL")
+            or os.environ.get("SIDECAR_URL", "http://localhost:4021")
+        ).rstrip("/")
         self.robot = robot
         self.skill = skill
         self.score = score
         self.anchor = anchor
         self.timeout = timeout
+        self.attempts = attempts
         self._pending: dict[str, tuple[Artifact, str]] = {}
 
     def register_resource(self, name, subtype, owner, metadata) -> dict:
@@ -282,13 +354,11 @@ class OnchainRoverSink(WorkSink):
     def task_end(self, run_ref: str, artifact: Artifact, *, label: str = "agent work", **kw) -> dict:
         self._pending[run_ref] = (artifact, label)
         try:
-            r = httpx.post(
+            return _retry(lambda: _post_json(
                 f"{self.sidecar_url}/proof",
-                json={"blobId": artifact.walrus_blob_id, "sha256": artifact.sha256, "label": label},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return r.json()
+                {"blobId": artifact.walrus_blob_id, "sha256": artifact.sha256, "label": label},
+                self.timeout,
+            ), attempts=self.attempts)
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -303,14 +373,14 @@ class OnchainRoverSink(WorkSink):
         # settle.giveFeedback re-adds the 0x prefix to sha256 — send the bare hex.
         sha = artifact.sha256[2:] if artifact.sha256.startswith("0x") else artifact.sha256
         try:
-            r = httpx.post(
+            # Retry only transport errors; a chain rejection comes back as an HTTP
+            # error status and is surfaced (not retried) by ``_retry``.
+            return _retry(lambda: _post_json(
                 f"{self.sidecar_url}/give-feedback",
-                json={"robot": self.robot, "skill": self.skill, "score": score,
-                      "blobId": artifact.walrus_blob_id, "sha256": sha},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return r.json()  # { tx, status, explorer, ... }
+                {"robot": self.robot, "skill": self.skill, "score": score,
+                 "blobId": artifact.walrus_blob_id, "sha256": sha},
+                self.timeout,
+            ), attempts=self.attempts)  # { tx, status, explorer, ... }
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -401,7 +471,10 @@ class SolanaRoverSink(WorkSink):
         anchor: bool = True,
         cluster: str = "devnet",
         timeout: float = 30.0,
+        attempts: int = SIDECAR_POST_ATTEMPTS,
     ):
+        # Solana sidecar keeps its own SOLANA_SIDECAR_URL; the shared SIDECAR_URL
+        # (port 4021) is only a last-resort fallback for backward compatibility.
         self.sidecar_url = (
             sidecar_url or os.environ.get("SOLANA_SIDECAR_URL")
             or os.environ.get("SIDECAR_URL", "http://localhost:4021")
@@ -412,6 +485,7 @@ class SolanaRoverSink(WorkSink):
         self.anchor = anchor
         self.cluster = cluster
         self.timeout = timeout
+        self.attempts = attempts
         self._pending: dict[str, tuple[Artifact, str]] = {}
 
     def register_resource(self, name, subtype, owner, metadata) -> dict:
@@ -424,13 +498,11 @@ class SolanaRoverSink(WorkSink):
     def task_end(self, run_ref: str, artifact: Artifact, *, label: str = "agent work", **kw) -> dict:
         self._pending[run_ref] = (artifact, label)
         try:
-            r = httpx.post(
+            return _retry(lambda: _post_json(
                 f"{self.sidecar_url}/proof",
-                json={"blobId": artifact.walrus_blob_id, "sha256": artifact.sha256, "label": label},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return r.json()
+                {"blobId": artifact.walrus_blob_id, "sha256": artifact.sha256, "label": label},
+                self.timeout,
+            ), attempts=self.attempts)
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -445,14 +517,14 @@ class SolanaRoverSink(WorkSink):
         # the Solana client strips a leading 0x; send bare hex for consistency.
         sha = artifact.sha256[2:] if artifact.sha256.startswith("0x") else artifact.sha256
         try:
-            r = httpx.post(
+            # Retry only transport errors; a definitive chain rejection (HTTP error
+            # status) is surfaced immediately, not retried.
+            out = _retry(lambda: _post_json(
                 f"{self.sidecar_url}/give-feedback",
-                json={"robot": self.robot, "skill": self.skill, "score": score,
-                      "blobId": artifact.walrus_blob_id, "sha256": sha},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            out = r.json()
+                {"robot": self.robot, "skill": self.skill, "score": score,
+                 "blobId": artifact.walrus_blob_id, "sha256": sha},
+                self.timeout,
+            ), attempts=self.attempts)
             sig = out.get("tx") or out.get("signature")
             if sig and "explorer" not in out:
                 out["explorer"] = solana_explorer_tx(sig, self.cluster)
@@ -463,22 +535,36 @@ class SolanaRoverSink(WorkSink):
 
 
 class MultiSink(WorkSink):
-    """Fan a single piece of work out to several sinks."""
+    """Fan a single piece of work out to several sinks.
+
+    Each sink is called independently: a failure in one sink is captured as
+    ``{"ok": False, "error": ...}`` in its slot so the remaining sinks still run
+    (one ledger being down must not abort the rest of the fan-out).
+    """
 
     def __init__(self, *sinks: WorkSink):
         self.sinks = list(sinks)
 
+    def _fan(self, method: str, *a, **k) -> list:
+        out = []
+        for s in self.sinks:
+            try:
+                out.append(getattr(s, method)(*a, **k))
+            except Exception as e:  # noqa: BLE001 - isolate one sink's failure
+                out.append({"ok": False, "error": str(e)})
+        return out
+
     def register_resource(self, *a, **k):
-        return [s.register_resource(*a, **k) for s in self.sinks]
+        return self._fan("register_resource", *a, **k)
 
     def task_start(self, *a, **k):
-        return [s.task_start(*a, **k) for s in self.sinks]
+        return self._fan("task_start", *a, **k)
 
     def task_end(self, *a, **k):
-        return [s.task_end(*a, **k) for s in self.sinks]
+        return self._fan("task_end", *a, **k)
 
     def task_validate(self, *a, **k):
-        return [s.task_validate(*a, **k) for s in self.sinks]
+        return self._fan("task_validate", *a, **k)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +578,24 @@ class WorkRecord:
     label: str
     vrw_points: int
     results: dict = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        """True unless some stage result explicitly reports ``ok == False``.
+
+        Each stage value is either a single response (a sink's dict) or a list of
+        responses (a :class:`MultiSink` fan-out). A result is failing only if a
+        dict in it carries ``ok`` set to a falsy value; results without an ``ok``
+        key (e.g. a successful ``{"tx": ...}``) count as passing.
+        """
+        def _stage_ok(result: Any) -> bool:
+            items = result if isinstance(result, list) else [result]
+            for item in items:
+                if isinstance(item, dict) and "ok" in item and not item["ok"]:
+                    return False
+            return True
+
+        return all(_stage_ok(r) for r in self.results.values())
 
 
 def submit_work(

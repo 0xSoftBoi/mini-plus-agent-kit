@@ -7,6 +7,35 @@ import mini_plus_agent_kit.work as W
 from _bootstrap import Resp
 
 
+def _ensure_httpx_errors():
+    """Give the hermetic httpx stub a real exception hierarchy so retry tests can
+    distinguish transport errors (retried) from HTTP status errors (surfaced)."""
+    if not hasattr(W.httpx, "HTTPError"):
+        class HTTPError(Exception):
+            def __init__(self, *a, **k):
+                super().__init__(*(a[:1]))
+
+        class RequestError(HTTPError):
+            pass
+
+        class ConnectError(RequestError):
+            pass
+
+        class HTTPStatusError(HTTPError):
+            pass
+
+        W.httpx.HTTPError = HTTPError
+        W.httpx.RequestError = RequestError
+        W.httpx.ConnectError = ConnectError
+        W.httpx.HTTPStatusError = HTTPStatusError
+
+
+_ensure_httpx_errors()
+
+# Capture the real walrus_put before any test monkeypatches it to a stub.
+_REAL_WALRUS_PUT = W.walrus_put
+
+
 def _patch_walrus():
     W.walrus_put = lambda data, **k: "BLOBZ"
 
@@ -181,6 +210,148 @@ def test_multisink_fans_out():
 
     ms = W.MultiSink(FakeSink(), M.OnchainRoverSink(sidecar_url="http://x"))
     assert len(ms.task_start("e1")) == 2
+
+
+def test_multisink_isolates_one_sink_failure():
+    # A sink that raises must not abort the fan-out: its slot is captured as an
+    # error dict and the other sinks still run.
+    class BoomSink(W.WorkSink):
+        def register_resource(s, *a, **k): return {}
+        def task_start(s, e, **k): raise RuntimeError("ledger down")
+        def task_end(s, r, a, **k): return {}
+        def task_validate(s, r, p): return {}
+
+    class OkSink(W.WorkSink):
+        def register_resource(s, *a, **k): return {}
+        def task_start(s, e, **k): return {"task_run_id": "RUN1"}
+        def task_end(s, r, a, **k): return {}
+        def task_validate(s, r, p): return {}
+
+    ms = W.MultiSink(BoomSink(), OkSink())
+    res = ms.task_start("e1")
+    assert len(res) == 2
+    assert res[0] == {"ok": False, "error": "ledger down"}
+    assert res[1] == {"task_run_id": "RUN1"}
+
+
+def test_walrus_put_retries_transport_error_then_succeeds():
+    # First call raises a transport error, second returns the blob. Retry must
+    # recover; sleep is monkeypatched so the test never waits.
+    calls = {"n": 0}
+
+    def flaky_put(url, params=None, content=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise W.httpx.ConnectError("boom")
+        return Resp({"newlyCreated": {"blobObject": {"blobId": "BLOBZ"}}})
+
+    orig_put, orig_sleep = W.httpx.put, W.time.sleep
+    W.httpx.put = flaky_put
+    W.time.sleep = lambda *_a, **_k: None
+    try:
+        assert _REAL_WALRUS_PUT(b"x", attempts=3) == "BLOBZ"
+        assert calls["n"] == 2
+    finally:
+        W.httpx.put, W.time.sleep = orig_put, orig_sleep
+
+
+def test_walrus_put_single_shot_when_attempts_one():
+    def boom_put(url, params=None, content=None, timeout=None):
+        raise W.httpx.ConnectError("boom")
+
+    orig_put = W.httpx.put
+    W.httpx.put = boom_put
+    try:
+        raised = False
+        try:
+            _REAL_WALRUS_PUT(b"x", attempts=1)
+        except Exception:
+            raised = True
+        assert raised
+    finally:
+        W.httpx.put = orig_put
+
+
+def test_give_feedback_does_not_retry_chain_rejection():
+    # An HTTP error status (definitive chain rejection) is NOT retried — it is
+    # surfaced once as an error result and the POST fires exactly one time.
+    _patch_walrus()
+    posts = {"n": 0}
+
+    def rejecting_post(url, json=None, timeout=None):
+        if url.endswith("/give-feedback"):
+            posts["n"] += 1
+            raise W.httpx.HTTPStatusError("rejected", request=None, response=None)
+        return Resp({"ok": True})
+
+    orig_post, orig_sleep = W.httpx.post, W.time.sleep
+    W.httpx.post = rejecting_post
+    W.time.sleep = lambda *_a, **_k: None
+    try:
+        rec = M.submit_work(M.OnchainRoverSink(sidecar_url="http://x", attempts=3),
+                            b"x", label="t", vrw_points=50)
+        assert posts["n"] == 1                       # not retried
+        assert rec.results["validate"]["ok"] is False
+    finally:
+        W.httpx.post, W.time.sleep = orig_post, orig_sleep
+
+
+def test_give_feedback_retries_transport_error():
+    _patch_walrus()
+    posts = {"n": 0}
+
+    def flaky_post(url, json=None, timeout=None):
+        if url.endswith("/give-feedback"):
+            posts["n"] += 1
+            if posts["n"] == 1:
+                raise W.httpx.ConnectError("boom")
+            return Resp({"tx": "0xfb", "status": "success"})
+        return Resp({"ok": True})
+
+    orig_post, orig_sleep = W.httpx.post, W.time.sleep
+    W.httpx.post = flaky_post
+    W.time.sleep = lambda *_a, **_k: None
+    try:
+        rec = M.submit_work(M.OnchainRoverSink(sidecar_url="http://x", attempts=3),
+                            b"x", label="t", vrw_points=50)
+        assert posts["n"] == 2                       # retried once, then succeeded
+        assert rec.results["validate"]["tx"] == "0xfb"
+    finally:
+        W.httpx.post, W.time.sleep = orig_post, orig_sleep
+
+
+def test_workrecord_ok_property_folds_stage_results():
+    art = W.Artifact("0xab", "BLOBZ", "http://u", "bafkrei", "image/jpeg", 1)
+    good = W.WorkRecord("e", "r", art, "l", 1,
+                        {"start": {"ok": True}, "end": {"tx": "0x1"},
+                         "validate": [{"ok": True}, {"tx": "0x2"}]})
+    assert good.ok is True
+    bad = W.WorkRecord("e", "r", art, "l", 1,
+                       {"start": {"task_run_id": "RUN1"},
+                        "validate": [{"ok": True}, {"ok": False, "error": "x"}]})
+    assert bad.ok is False
+
+
+def test_onchain_rover_env_precedence_arc_over_sidecar():
+    # ARC_SIDECAR_URL wins over the shared SIDECAR_URL (port-4021 collision fix);
+    # SOLANA_SIDECAR_URL governs the Solana sink independently.
+    import os
+    saved = {k: os.environ.get(k) for k in ("ARC_SIDECAR_URL", "SIDECAR_URL", "SOLANA_SIDECAR_URL")}
+    try:
+        os.environ["ARC_SIDECAR_URL"] = "http://arc:1"
+        os.environ["SIDECAR_URL"] = "http://shared:4021"
+        os.environ["SOLANA_SIDECAR_URL"] = "http://sol:2"
+        assert M.OnchainRoverSink().sidecar_url == "http://arc:1"
+        assert M.SolanaRoverSink().sidecar_url == "http://sol:2"
+        # Without ARC override, OnchainRoverSink falls back to the shared URL.
+        del os.environ["ARC_SIDECAR_URL"]
+        assert M.OnchainRoverSink().sidecar_url == "http://shared:4021"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
     mpak shot [--map] [-o DIR]       # save current camera frames to disk
     mpak speak "hello"               # text-to-speech out of the rover
     mpak mission "<objective>"       # autonomous Claude-driven run
+    mpak sim [--north M --east M]    # closed-loop nav in simulation (no hardware/API key)
     mpak checkpoints                 # list mission checkpoints
 
 Set ROVER_URL (default http://localhost:8000) and ANTHROPIC_API_KEY in the env.
@@ -83,14 +84,20 @@ def cmd_speak(args) -> int:
 
 
 def _build_work(args):
-    """Assemble a WorkSink from --bitrobot / --onchain flags (or None)."""
-    from .work import BitRobotSink, OnchainRoverSink, MultiSink
+    """Assemble a WorkSink from --bitrobot / --onchain / --solana / --race flags (or None)."""
+    from .work import (
+        BitRobotSink, OnchainRoverSink, SolanaRoverSink, RaceProofSink, MultiSink,
+    )
 
     sinks = []
     if args.bitrobot:
         sinks.append(BitRobotSink())  # reads BITROBOT_SUBNET_ID / BITROBOT_API_KEY
     if args.onchain:
         sinks.append(OnchainRoverSink())  # reads SIDECAR_URL
+    if getattr(args, "solana", False):
+        sinks.append(SolanaRoverSink())  # reads SOLANA_SIDECAR_URL / SIDECAR_URL
+    if getattr(args, "race", None) is not None:
+        sinks.append(RaceProofSink(winner_idx=args.race))  # settle a RaceMarket race
     if not sinks:
         return None
     return sinks[0] if len(sinks) == 1 else MultiSink(*sinks)
@@ -108,9 +115,30 @@ def cmd_register(args) -> int:
     return 0
 
 
+def _preflight(args) -> str | None:
+    """Check ANTHROPIC_API_KEY and backend reachability. Return an error string or None."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return ("ANTHROPIC_API_KEY is not set — the agent needs it to call Claude. "
+                "Export it (https://console.anthropic.com/) and retry.")
+    url = os.environ.get("HARNESS_URL", args.url) if args.backend == "waveshare" else args.url
+    try:
+        with _rover(args) as rover:
+            rover.data()
+    except EarthRoverError as e:
+        return f"backend at {url} is unreachable: {e.detail}"
+    except Exception as e:
+        return f"backend at {url} is unreachable: {e}"
+    return None
+
+
 def cmd_mission(args) -> int:
     # Imported lazily so `status`/`teleop`/`shot` work without the anthropic pkg.
     from .agent import MiniPlusAgent
+
+    err = _preflight(args)
+    if err:
+        print(f"preflight failed: {err}", file=sys.stderr)
+        return 1
 
     if args.backend == "waveshare":
         from .harness_client import HarnessClient
@@ -124,6 +152,7 @@ def cmd_mission(args) -> int:
             except EarthRoverError as e:
                 print(f"could not start mission: {e.detail}", file=sys.stderr)
                 return 1
+    result = None
     try:
         agent = MiniPlusAgent(
             rover,
@@ -143,7 +172,7 @@ def cmd_mission(args) -> int:
             rover.close()
         except Exception:
             pass
-    return 0 if result.success else 2
+    return 0 if (result is not None and result.success) else 2
 
 
 def cmd_telegram(args) -> int:
@@ -162,6 +191,7 @@ def cmd_telegram(args) -> int:
         rover = _rover(args)
     bridge = TelegramBridge(rover, token, work=_build_work(args),
                             resource_name=args.resource_name,
+                            allowed_chats=args.allow_chat or None,
                             on_event=lambda m: print(m, flush=True))
     try:
         bridge.run_forever()
@@ -191,6 +221,31 @@ def cmd_mcp(args) -> int:
         except Exception:
             pass
     return 0
+
+
+def cmd_sim(args) -> int:
+    """Run a closed-loop navigation scenario in simulation (no hardware, no API key)."""
+    import math
+
+    from .control import NavController
+    from .sim import RoverSim, run_scenario, SPEED_MPS
+
+    base_lat, base_lon = 37.87, -122.25
+    m_per_deg = 111_320.0
+    mlon = m_per_deg * math.cos(math.radians(base_lat))
+    goal_lat = base_lat + args.north / m_per_deg
+    goal_lon = base_lon + args.east / mlon
+
+    nav = NavController(base_lat, base_lon, tol_m=args.tol, v_scale_mps=SPEED_MPS)
+    sim = RoverSim(base_lat=base_lat, base_lon=base_lon, seed=42)
+    r = run_scenario(nav, sim, goal_lat, goal_lon, max_steps=args.max_steps, tol_m=args.tol)
+
+    print(f"goal: {args.north:.1f} m north, {args.east:.1f} m east  (tol {args.tol:.1f} m)")
+    print(f"arrived={r['arrived']} success={r['success']} steps={r['steps']}")
+    print(f"arrival distance: {r['true_dist']:.2f} m")
+    rmse = r["heading_rmse"]
+    print(f"heading RMSE: {rmse:.2f} deg" if rmse is not None else "heading RMSE: n/a")
+    return 0 if r["success"] else 2
 
 
 def cmd_teleop(args) -> int:
@@ -260,8 +315,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--token", default=None, help="Bot token (or env TELEGRAM_BOT_TOKEN).")
     sp.add_argument("--bitrobot", action="store_true", help="Submit VRW to the BitRobot subnet.")
     sp.add_argument("--onchain", action="store_true", help="Anchor proofs via your sidecar.")
+    sp.add_argument("--allow-chat", action="append", type=int, default=[], metavar="CHAT_ID",
+                    help="Authorize a chat id (repeatable; else env TELEGRAM_ALLOWED_CHATS). "
+                         "Fails closed: with none set, ALL messages are ignored.")
     sp.add_argument("--resource-name", default=None)
     sp.set_defaults(func=cmd_telegram)
+
+    sp = sub.add_parser("sim", help="Closed-loop navigation in simulation (no hardware/API key).")
+    sp.add_argument("--north", type=float, default=60.0, help="Goal offset north (m).")
+    sp.add_argument("--east", type=float, default=25.0, help="Goal offset east (m).")
+    sp.add_argument("--tol", type=float, default=9.0, help="Arrival tolerance (m).")
+    sp.add_argument("--max-steps", type=int, default=900, help="Max simulation steps.")
+    sp.set_defaults(func=cmd_sim)
 
     sp = sub.add_parser("teleop", help="Manual keyboard driving.")
     sp.add_argument("--step", type=float, default=0.6, help="Linear/angular magnitude.")
@@ -288,6 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Submit Verifiable Robotic Work to the BitRobot subnet API.")
     sp.add_argument("--onchain", action="store_true",
                     help="Register proofs with your onchain-rover sidecar (settle.ts).")
+    sp.add_argument("--solana", action="store_true",
+                    help="Anchor proofs on the clanker5000 Solana program (SolanaRoverSink).")
+    sp.add_argument("--race", type=int, default=None, metavar="WINNER_IDX",
+                    help="Settle a RaceMarket race with the captured finish proof (winner index).")
     sp.add_argument("--resource-name", default=None, help="Robot resource name for VRW.")
     sp.add_argument("--model", default=os.environ.get("MPAK_MODEL", "claude-opus-4-8"))
     sp.add_argument("--max-turns", type=int, default=60)

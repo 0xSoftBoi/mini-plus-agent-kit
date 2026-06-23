@@ -18,6 +18,7 @@ duplicated anywhere.
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -133,11 +134,24 @@ def _h_autonav(verbs, args, ctx):
 
 
 def _h_navigate(verbs, args, ctx):
-    return ToolOutcome([_text(verbs.navigate().get("reply") or "navigating")])
+    res = verbs.navigate()
+    blocks = [_text(res.get("reply") or "navigating")]
+    nums = {k: res[k] for k in
+            ("distance_m", "bearing_deg", "heading_error_deg", "within_tolerance")
+            if k in res}
+    if nums:
+        blocks.append(_text(json.dumps(nums, separators=(",", ":"))))
+    return ToolOutcome(blocks)
 
 
 def _h_checkpoint_reached(verbs, args, ctx):
     return ToolOutcome([_text(str(verbs.checkpoint_reached()))])
+
+
+def _h_drive_to_checkpoint(verbs, args, ctx):
+    max_steps = args.get("max_steps")
+    res = verbs.drive_to_checkpoint(max_steps=int(max_steps) if max_steps is not None else None)
+    return ToolOutcome([_text(str(res))], is_error=not res.get("ok", res.get("done", True)))
 
 
 def _h_speak(verbs, args, ctx):
@@ -165,10 +179,21 @@ def _h_capture_work(verbs, args, ctx):
         resource_name=ctx.resource_name,
     )
     a = rec.artifact
-    return ToolOutcome([_text(
-        f"Work submitted ({rec.vrw_points} VRW): {rec.label}\n"
-        f"sha256={a.sha256} cid={a.ipfs_cid}\n{a.walrus_url}"
-    )])
+    failed = [stage for stage, r in rec.results.items() if _stage_failed(r)]
+    text = (f"Work submitted ({rec.vrw_points} VRW): {rec.label}\n"
+            f"sha256={a.sha256} cid={a.ipfs_cid}\n{a.walrus_url}")
+    if failed:
+        text += f"\nWARNING: on-chain write failed at stage(s): {', '.join(failed)}"
+    return ToolOutcome([_text(text)], is_error=bool(failed))
+
+
+def _stage_failed(result: Any) -> bool:
+    """True if a submit_work stage result (dict, or MultiSink list) reports ok==False."""
+    if isinstance(result, dict):
+        return result.get("ok") is False
+    if isinstance(result, list):
+        return any(_stage_failed(r) for r in result)
+    return False
 
 
 def _h_finish(verbs, args, ctx):
@@ -237,6 +262,15 @@ VERBS: list[Verb] = [
          "Claim arrival at the next checkpoint (succeeds only within the ~15 m GPS "
          "tolerance). Call when navigate reports within tolerance.",
          _NO_ARGS, _h_checkpoint_reached),
+    Verb("drive_to_checkpoint", "drive_to_checkpoint",
+         "Autonomously drive to the next checkpoint with the fused closed-loop "
+         "controller (heading/pose fusion, pursuit steering, safety envelope) and "
+         "claim it on arrival. Prefer this over stepping navigate/turn/move by hand "
+         "on a checkpoint mission. Optional max_steps caps the control loop.",
+         {"type": "object",
+          "properties": {"max_steps": {"type": "integer", "minimum": 1}},
+          "additionalProperties": False},
+         _h_drive_to_checkpoint),
     Verb("speak", "speak",
          "Speak text aloud through the rover's speaker (warnings, greetings).",
          {"type": "object", "properties": {"text": {"type": "string"}},

@@ -28,6 +28,27 @@ def test_telemetry_from_harness_surfaces_lidar_and_estop():
     assert "lidar_front=0.42m" in s and "path_blocked=YES" in s
 
 
+def test_telemetry_from_harness_speed_uses_odometry():
+    # Measured wheel odometry wins over the commanded twist.
+    t = Telemetry.from_harness({"odometry_left": 0.8, "odometry_right": 1.2,
+                                "left_cmd": 0.0, "right_cmd": 0.0})
+    assert abs(t.speed - 1.0) < 1e-9
+    assert t.speed_is_estimated is False
+    # A single wheel's odometry still counts as measured.
+    t1 = Telemetry.from_harness({"odometry_left": 0.5})
+    assert abs(t1.speed - 0.5) < 1e-9 and t1.speed_is_estimated is False
+
+
+def test_telemetry_from_harness_speed_falls_back_to_command():
+    # No odometry → fall back to command average, flagged as estimated.
+    t = Telemetry.from_harness({"left_cmd": 0.3, "right_cmd": 0.5})
+    assert abs(t.speed - 0.4) < 1e-9
+    assert t.speed_is_estimated is True
+    # Nothing at all → no speed, not flagged.
+    t0 = Telemetry.from_harness({})
+    assert t0.speed is None and t0.speed_is_estimated is False
+
+
 def test_telemetry_from_dict_frodobots():
     t = Telemetry.from_dict({"battery": 100, "orientation": 128, "latitude": 22.7,
                              "longitude": 114.0, "lamp": 0})

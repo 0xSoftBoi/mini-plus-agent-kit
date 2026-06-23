@@ -31,8 +31,10 @@ class _FakeAnthropic:
     def __init__(self, script):
         self._script, self._i = script, 0
         self.messages = self
+        self.calls = []
 
     def create(self, **kw):
+        self.calls.append(kw)
         r = self._script[self._i]; self._i += 1; return r
 
 
@@ -76,7 +78,8 @@ def main():
         _Resp([_tu("finish", {"success": True, "reason": "box reached"}, "t4")], "tool_use"),
     ]
     verbs, sink = FakeVerbs(), RecordingSink()
-    agent = MiniPlusAgent(verbs, client=_FakeAnthropic(script), work=sink,
+    fake = _FakeAnthropic(script)
+    agent = MiniPlusAgent(verbs, client=fake, work=sink,
                           resource_name="ugv_001", on_event=lambda *_: None)
 
     tnames = {t["name"] for t in agent.tools}
@@ -93,7 +96,38 @@ def main():
     assert sink.events[1][0] == "end" and sink.events[1][1] == "BLOBX" and sink.events[1][2].startswith("bafkrei")
     assert sink.events[2] == ("validate", 90)
 
+    # Request shape: raised max_tokens + Anthropic prompt caching on system + tools.
+    kw = fake.calls[0]
+    assert kw["max_tokens"] == 16384
+    sys_blocks = kw["system"]
+    assert isinstance(sys_blocks, list)
+    assert sys_blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    assert sys_blocks[-1]["type"] == "text" and sys_blocks[-1]["text"]
+    assert kw["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    # Caching markers must not leak onto non-final tool defs.
+    assert all("cache_control" not in t for t in kw["tools"][:-1])
+
+
+def test_max_tokens_continues_turn():
+    # A max_tokens stop reason should continue the turn, not nudge "use a tool".
+    script = [
+        _Resp([_Block("text", text="thinking very hard and getting cut off")], "max_tokens"),
+        _Resp([_tu("finish", {"success": True, "reason": "done"}, "t1")], "tool_use"),
+    ]
+    verbs = FakeVerbs()
+    fake = _FakeAnthropic(script)
+    agent = MiniPlusAgent(verbs, client=fake, on_event=lambda *_: None)
+    result = agent.run("Reach the box.")
+    assert result.finished and result.success and result.reason == "done"
+    assert result.turns == 2
+    # The follow-up after a max_tokens stop is a "continue" nudge, not a tool nudge.
+    # (messages is mutated in place across turns: index 2 is the post-truncation user
+    # turn — initial user [0], truncated assistant [1], then the continue nudge [2].)
+    follow_up = result.messages[2]["content"][0]["text"]
+    assert "Continue" in follow_up and "tool" not in follow_up.lower()
+
 
 if __name__ == "__main__":
     main()
+    test_max_tokens_continues_turn()
     print("agent-loop e2e: PASS")

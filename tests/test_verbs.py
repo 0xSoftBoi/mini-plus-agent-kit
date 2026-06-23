@@ -5,6 +5,7 @@ import base64
 
 from mini_plus_agent_kit.client import EarthRoverClient
 from mini_plus_agent_kit.rover import EarthRoverVerbs
+from mini_plus_agent_kit.tools import dispatch
 
 
 def _recording_client():
@@ -65,6 +66,85 @@ def test_turn_sends_degrees():
     c._request = lambda m, p, **k: (seen.append((p, k.get("json"))) or {"requested": 90})
     c.turn(90)
     assert seen[0][0] == "/turn" and seen[0][1]["degrees"] == 90
+
+
+def test_navigate_handler_emits_structured_numbers():
+    v = EarthRoverVerbs(EarthRoverClient("http://x"))
+    v.navigate = lambda: {"reply": "checkpoint #2: 40 m away", "distance_m": 40.0,
+                          "bearing_deg": 95.0, "heading_error_deg": -12.0,
+                          "within_tolerance": False}
+    out = dispatch(v, "navigate", {})
+    texts = [b["text"] for b in out.blocks if b.get("type") == "text"]
+    assert any("checkpoint #2" in t for t in texts)            # prose retained
+    import json
+    nums = next(json.loads(t) for t in texts if t.startswith("{"))
+    assert nums == {"distance_m": 40.0, "bearing_deg": 95.0,
+                    "heading_error_deg": -12.0, "within_tolerance": False}
+
+
+def test_capture_work_flags_onchain_failure():
+    import mini_plus_agent_kit.tools as T
+
+    class _Art:
+        sha256, ipfs_cid, walrus_url = "0xabc", "bafkrei1", "https://w/x"
+
+    class _Rec:
+        vrw_points, label, artifact = 100, "proof", _Art()
+        results = {"start": {"ok": True}, "end": {"ok": True},
+                   "validate": {"ok": False, "error": "chain down"}}
+
+    orig = T.submit_work
+    T.submit_work = lambda *a, **k: _Rec()
+    try:
+        v = EarthRoverVerbs(EarthRoverClient("http://x"))
+        v.photo = lambda: b"JPG"
+        out = dispatch(v, "capture_work", {"label": "proof"}, work=object())
+    finally:
+        T.submit_work = orig
+    assert out.is_error is True
+    assert "validate" in out.blocks[0]["text"]
+
+
+def test_capture_work_success_is_not_an_error():
+    import mini_plus_agent_kit.tools as T
+
+    class _Art:
+        sha256, ipfs_cid, walrus_url = "0xabc", "bafkrei1", "https://w/x"
+
+    class _Rec:
+        vrw_points, label, artifact = 100, "proof", _Art()
+        results = {"start": {"ok": True}, "end": {"ok": True}, "validate": {"tx": "0xok"}}
+
+    orig = T.submit_work
+    T.submit_work = lambda *a, **k: _Rec()
+    try:
+        v = EarthRoverVerbs(EarthRoverClient("http://x"))
+        v.photo = lambda: b"JPG"
+        out = dispatch(v, "capture_work", {"label": "proof"}, work=object())
+    finally:
+        T.submit_work = orig
+    assert out.is_error is False
+    assert "WARNING" not in out.blocks[0]["text"]
+
+
+def test_drive_to_checkpoint_delegates_to_fused_controller():
+    v = EarthRoverVerbs(EarthRoverClient("http://x"))
+    seen = {}
+    v.goto_checkpoint_fused = lambda **kw: (seen.update(kw) or {"ok": True, "reached": 1})
+    # max_steps=None keeps goto_checkpoint_fused's own default (not forwarded).
+    assert v.drive_to_checkpoint() == {"ok": True, "reached": 1}
+    assert seen == {}
+    # An explicit cap is forwarded.
+    assert v.drive_to_checkpoint(max_steps=12)["ok"] is True
+    assert seen == {"max_steps": 12}
+
+
+def test_dispatch_drive_to_checkpoint_handler():
+    v = EarthRoverVerbs(EarthRoverClient("http://x"))
+    v.goto_checkpoint_fused = lambda **kw: {"ok": False, "reason": "max_steps"}
+    out = dispatch(v, "drive_to_checkpoint", {"max_steps": 3})
+    assert out.is_error is True  # ok==False surfaces as a tool error
+    assert "max_steps" in out.blocks[0]["text"]
 
 
 if __name__ == "__main__":

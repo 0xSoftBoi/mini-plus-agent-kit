@@ -46,6 +46,29 @@ def _require_lerobot() -> None:
         )
 
 
+def _require_vision_deps() -> None:
+    """Fail fast if the camera-decode stack (numpy + cv2) is missing.
+
+    The image path needs both; detecting this at ``connect()`` gives a single
+    clear error instead of crashing lazily on the first ``get_observation``.
+    """
+    missing = []
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append("numpy")
+    try:
+        import cv2  # noqa: F401
+    except Exception:
+        missing.append("opencv-python")
+    if missing:
+        raise ImportError(
+            "WaveshareUGV camera decode needs "
+            + " and ".join(missing)
+            + ": pip install " + " ".join(missing)
+        )
+
+
 @RobotConfig.register_subclass("waveshare_ugv")
 @dataclass
 class WaveshareUGVConfig(RobotConfig):
@@ -86,12 +109,14 @@ class WaveshareUGV(Robot):  # type: ignore[misc]
 
     @property
     def observation_features(self) -> dict[str, Any]:
-        # Mirror the Mini+ telemetry features that the UGV also has, + lidar.
+        # Mirror the Mini+ telemetry features that the UGV also has, + lidar + GPS.
         scalar = [
             "speed", "battery", "orientation",
+            "latitude", "longitude",
             "accel_x", "accel_y", "accel_z",
             "gyro_x", "gyro_y", "gyro_z",
-            "lidar_front_m",
+            "lidar_front_m", "lidar_blocked", "estop",
+            "timestamp",
         ]
         return {**self._camera_ft, **{k: float for k in scalar}}
 
@@ -106,6 +131,7 @@ class WaveshareUGV(Robot):  # type: ignore[misc]
     # -- lifecycle -----------------------------------------------------------
 
     def connect(self, calibrate: bool = True) -> None:
+        _require_vision_deps()  # fail fast, not on the first frame
         self._client = HarnessClient(self.config.harness_url, speed_mode=self.config.speed_mode)
 
     def calibrate(self) -> None:  # no-op
@@ -124,23 +150,28 @@ class WaveshareUGV(Robot):  # type: ignore[misc]
     def get_observation(self) -> dict[str, Any]:
         assert self._client is not None, "call connect() first"
         obs: dict[str, Any] = {}
+        # One shared timestamp for the camera+telemetry pair (the obs is sampled
+        # once; downstream alignment shouldn't see two different clocks).
+        obs_ts = time.time()
         # Camera frame → HWC uint8 (LeRobot image convention).
         b64 = self._client.screenshot_v2().get("front_frame")
         obs["front"] = _decode_jpeg_b64(b64, self.config.camera_height, self.config.camera_width)
         # Telemetry.
         t = self._client.data()
-        raw = t.raw
-        accel = raw.get("imu", {}).get("accel", {}) if isinstance(raw.get("imu"), dict) else {}
-        gyro = raw.get("imu", {}).get("gyro", {}) if isinstance(raw.get("imu"), dict) else {}
+        ax, ay, az = _imu_vec3(t.raw, "accel")
+        gx, gy, gz = _imu_vec3(t.raw, "gyro")
         obs.update(
             speed=float(t.speed or 0.0),
             battery=float(t.battery or 0.0),
             orientation=float(t.orientation or 0.0),
-            accel_x=float(accel.get("x", 0.0)), accel_y=float(accel.get("y", 0.0)),
-            accel_z=float(accel.get("z", 0.0)),
-            gyro_x=float(gyro.get("x", 0.0)), gyro_y=float(gyro.get("y", 0.0)),
-            gyro_z=float(gyro.get("z", 0.0)),
+            latitude=float(t.latitude or 0.0),
+            longitude=float(t.longitude or 0.0),
+            accel_x=ax, accel_y=ay, accel_z=az,
+            gyro_x=gx, gyro_y=gy, gyro_z=gz,
             lidar_front_m=float(t.lidar_front_m or 0.0),
+            lidar_blocked=float(bool(t.lidar_blocked)),
+            estop=float(bool(t.estop)),
+            timestamp=obs_ts,
         )
         return obs
 
@@ -152,6 +183,30 @@ class WaveshareUGV(Robot):  # type: ignore[misc]
         self._client.control(linear=linear, angular=angular)
         return {"linear_velocity": linear, "angular_velocity": angular,
                 "left": left, "right": right, "ts": time.time()}
+
+
+def _imu_vec3(raw: dict[str, Any], key: str) -> tuple[float, float, float]:
+    """Read ``raw["imu"][key]`` as an (x, y, z) tuple, falling back to zeros.
+
+    The robot-harness serializes ``imu.accel``/``gyro``/``mag`` as JSON arrays
+    ``[x, y, z]`` (see robot-harness/src/main.rs ``ImuStatus``). A dict shape
+    ``{"x":..,"y":..,"z":..}`` is also accepted for forward/backward tolerance.
+    """
+    imu = raw.get("imu")
+    if not isinstance(imu, dict):
+        return (0.0, 0.0, 0.0)
+    v = imu.get(key)
+    if isinstance(v, (list, tuple)) and len(v) >= 3:
+        try:
+            return (float(v[0]), float(v[1]), float(v[2]))
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 0.0)
+    if isinstance(v, dict):
+        try:
+            return (float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0)))
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 0.0)
+    return (0.0, 0.0, 0.0)
 
 
 def _decode_jpeg_b64(b64: str | None, h: int, w: int):

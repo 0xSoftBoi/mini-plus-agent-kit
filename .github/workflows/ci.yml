@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hermetic:
+    name: hermetic suite (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # run_all.py is dependency-free (httpx/anthropic are stubbed) and exits
+      # non-zero on any failure — no install step needed.
+      - name: Run hermetic suite
+        run: python3 tests/run_all.py
+
+  live:
+    name: live suite (non-blocking)
+    # Live tests install real deps and hit a public testnet; keep them
+    # informational and only on main so PRs aren't gated by network flakiness.
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run live suite
+        run: bash tests/live/run_live.sh

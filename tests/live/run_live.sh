@@ -9,6 +9,7 @@ python3 -m venv .venv 2>/dev/null || true
 .venv/bin/pip install -q --disable-pip-version-check httpx mcp anthropic Pillow numpy
 
 echo "== live: harness (real httpx round-trip) ==";  .venv/bin/python tests/live/test_live_harness.py
+echo "== live: lerobot (real telemetry round-trip, IMU arrays) =="; .venv/bin/python tests/live/test_live_lerobot.py
 echo "== live: mcp (real protocol → dispatch) ==";   .venv/bin/python tests/live/test_live_mcp.py
 echo "== live: track_color (real HSV visual servo) =="; .venv/bin/python tests/live/test_live_track_color.py
 echo "== live: navigate (real GPS waypoint controller) =="; .venv/bin/python tests/live/test_live_navigate.py

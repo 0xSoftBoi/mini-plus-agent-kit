@@ -197,11 +197,24 @@ mpak mission "Patrol and flag obstacles."        --backend waveshare  --onchain 
 mpak telegram --backend waveshare                # chat-drive the rover (openClaw demo)
 mpak register ugv_001 --backend waveshare --owner <SOL>   # BitRobot Entity NFT
 mpak mcp --backend waveshare                     # serve as an MCP server (see above)
+mpak sim               # run the nav stack in the simulator — no hardware (see below)
 mpak status            # telemetry + mission state
 mpak checkpoints       # list mission checkpoints (Earth Rover)
 mpak shot --map -o frames/                       # save camera frames
 mpak speak "hello"     # text-to-speech (Earth Rover)
 mpak teleop            # manual keyboard driving
+```
+
+### Simulate without a robot (`mpak sim`)
+
+`mpak sim` drives the **real `NavController`** through the unified `RoverSim`
+(`sim.py`) — the same closed-loop nav stack as on hardware, but with simulated
+GPS/IMU/odometry instead of a wired robot. It needs no backend, no keys, and no
+network: a quick way to watch the rover converge on a checkpoint (or run a small
+domain-randomized sweep) on any laptop before pointing the kit at a real rover.
+
+```bash
+mpak sim                       # one run to a checkpoint, printing convergence
 ```
 
 ### Chat surface (Telegram — the openClaw flagship demo)
@@ -354,7 +367,7 @@ controllers, safety, costmap + A* planner, closed-loop sim scenarios), all three
 work sinks, and a full scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 66 passed
+python3 tests/run_all.py     # zero-dependency runner (exits non-zero on failure)
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 

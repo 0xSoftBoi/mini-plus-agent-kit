@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
-    "anthropic>=0.69",
+    # 0.75 is the conservative floor that ships output_config.effort + adaptive
+    # thinking (thinking={"type": "adaptive"}, output_config={"effort": ...}),
+    # the reasoning controls agent.py/telegram.py drive against Opus 4.8.
+    "anthropic>=0.75",
     "httpx>=0.27",
 ]
 
@@ -23,6 +26,7 @@ lerobot = ["lerobot", "opencv-python", "numpy"]
 vision = ["google-genai"]
 track = ["Pillow", "numpy"]
 mcp = ["mcp"]
+dev = ["pytest"]
 
 [project.scripts]
 mpak = "mini_plus_agent_kit.cli:main"
@@ -31,4 +35,4 @@ mpak = "mini_plus_agent_kit.cli:main"
 packages = ["mini_plus_agent_kit"]
 
 [tool.setuptools.package-data]
-mini_plus_agent_kit = ["instructions/*.md"]
+mini_plus_agent_kit = ["instructions/*.md", "py.typed"]

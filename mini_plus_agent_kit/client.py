@@ -53,6 +53,7 @@ class Telemetry:
     lidar_front_m: float | None = None
     lidar_blocked: bool | None = None
     estop: bool | None = None
+    speed_is_estimated: bool = False  # True when speed fell back to the command average
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -77,16 +78,31 @@ class Telemetry:
     def from_harness(cls, d: dict[str, Any]) -> "Telemetry":
         """Map a Jetson ``robot-harness`` ``GET /telemetry`` frame."""
         lidar = d.get("lidar") or {}
-        left = d.get("left_cmd")
-        right = d.get("right_cmd")
+        # Prefer measured wheel odometry (odometry_left/right) over the commanded
+        # twist: the wheels report what the robot actually did, the command only
+        # what we asked for. Fall back to the command average (flagged estimated).
+        odl = d.get("odometry_left")
+        odr = d.get("odometry_right")
         speed = None
-        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-            speed = (left + right) / 2.0
+        speed_is_estimated = False
+        if isinstance(odl, (int, float)) and isinstance(odr, (int, float)):
+            speed = (odl + odr) / 2.0
+        elif isinstance(odl, (int, float)):
+            speed = float(odl)
+        elif isinstance(odr, (int, float)):
+            speed = float(odr)
+        else:
+            left = d.get("left_cmd")
+            right = d.get("right_cmd")
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                speed = (left + right) / 2.0
+                speed_is_estimated = True
         ts = d.get("ts_ms")
         return cls(
             battery=d.get("battery_v"),
             orientation=d.get("yaw"),
             speed=speed,
+            speed_is_estimated=speed_is_estimated,
             timestamp=(ts / 1000.0) if isinstance(ts, (int, float)) else None,
             lidar_front_m=lidar.get("front_m"),
             lidar_blocked=lidar.get("blocked"),

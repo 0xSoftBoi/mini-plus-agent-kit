@@ -73,6 +73,14 @@ class MiniPlusAgent:
         self.on_event = on_event or (lambda msg: None)
         self.system = load_system_prompt(system_extra)
         self.tools = make_tools(self.verbs.capabilities, has_work=work is not None)
+        # Anthropic prompt caching: send the (frozen) system prompt as a content
+        # block with a trailing cache breakpoint, and mark the last tool def so the
+        # tools+system prefix is cached across the loop's turns.
+        self._system_blocks = [{"type": "text", "text": self.system,
+                                "cache_control": {"type": "ephemeral"}}]
+        self._cached_tools = [dict(t) for t in self.tools]
+        if self._cached_tools:
+            self._cached_tools[-1]["cache_control"] = {"type": "ephemeral"}
 
     def _log(self, msg: str) -> None:
         self.on_event(msg)
@@ -88,11 +96,11 @@ class MiniPlusAgent:
             result.turns = turn
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=4096,
-                system=self.system,
+                max_tokens=16384,
+                system=self._system_blocks,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self.effort},
-                tools=self.tools,
+                tools=self._cached_tools,
                 messages=messages,
             )
             for block in response.content:
@@ -104,6 +112,12 @@ class MiniPlusAgent:
                 if response.stop_reason == "refusal":
                     result.reason = "model refused"
                     break
+                if response.stop_reason == "max_tokens":
+                    # Output was truncated mid-thought; let the model keep going
+                    # rather than nudging it to "use a tool".
+                    messages.append({"role": "user", "content": [{"type": "text", "text":
+                        "Your previous response was cut off. Continue."}]})
+                    continue
                 messages.append({"role": "user", "content": [{"type": "text", "text":
                     "Use a tool to act on the robot, or call finish if you are done."}]})
                 continue

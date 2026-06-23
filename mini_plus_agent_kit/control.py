@@ -158,8 +158,8 @@ class RegulatedPurePursuit:
 
     def step(self, x: float, y: float, heading_deg: float,
              path: list, v_now: float | None = None) -> Cmd:
-        if not path:
-            return Cmd(0.0, 0.0, 0.0, heading_deg, 0.0, True)
+        if not path:                                         # no path = no goal, not arrived
+            return Cmd(0.0, 0.0, 0.0, heading_deg, 0.0, False)
         gx, gy = path[-1]
         dist_goal = math.hypot(gx - x, gy - y)
         v = self.v_max if v_now is None else max(self.min_speed, v_now)
@@ -329,7 +329,8 @@ class SafetyEnvelope:
 
     def check(self, linear_cmd: float, *, battery: float | None = None,
               roll: float | None = None, pitch: float | None = None,
-              lidar_front_m: float | None = None, estop: bool = False) -> SafetyVerdict:
+              lidar_front_m: float | None = None, estop: bool = False,
+              v_scale_mps: float = 1.0) -> SafetyVerdict:
         L = self.limits
         if estop:
             return SafetyVerdict(False, 0.0, "estop engaged")
@@ -340,7 +341,8 @@ class SafetyEnvelope:
             return SafetyVerdict(False, 0.0, f"tilt {tilt:.0f}° ≥ {L.tilt_limit_deg}° (ramp/pickup/stuck)")
         # lidar time-to-collision (only when moving forward)
         if lidar_front_m is not None and linear_cmd > 1e-3:
-            ttc = lidar_front_m / max(1e-3, linear_cmd)   # crude TTC in "seconds" at unit speed
+            # real TTC in seconds: normalized command → m/s via v_scale_mps
+            ttc = lidar_front_m / max(1e-3, linear_cmd * v_scale_mps)
             if ttc <= L.ttc_min_s:
                 return SafetyVerdict(False, 0.0, f"TTC {ttc:.1f}s ≤ {L.ttc_min_s}s")
             if ttc < L.ttc_slow_s:
@@ -452,7 +454,8 @@ class NavController:
         else:                                                # seek the single waypoint
             cmd = self.pp.step(x, y, hhat, gx, gy)
         verdict = self.safety.check(cmd.linear, battery=battery, roll=roll, pitch=pitch,
-                                    lidar_front_m=lidar_front_m, estop=estop)
+                                    lidar_front_m=lidar_front_m, estop=estop,
+                                    v_scale_mps=self.v_scale_mps)
         linear = cmd.linear * verdict.scale if verdict.ok else 0.0
         angular = cmd.angular if verdict.ok else 0.0
         self._last_v = linear

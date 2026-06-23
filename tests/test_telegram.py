@@ -5,7 +5,9 @@ import base64
 
 from mini_plus_agent_kit.rover import RoverVerbs, Scene
 from mini_plus_agent_kit.client import Telemetry
-from mini_plus_agent_kit.telegram import RoverChat, TelegramBridge
+from mini_plus_agent_kit.telegram import (
+    RoverChat, TelegramBridge, redact_token, _parse_allowed_chats,
+)
 
 
 # --- scripted model stand-in ------------------------------------------------
@@ -105,7 +107,8 @@ def test_bridge_poll_once_routes_and_tracks_offset():
     api = FakeAPI([[
         {"update_id": 100, "message": {"chat": {"id": 42}, "text": "what do you see?"}},
     ]])
-    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic(script), api=api)
+    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic(script), api=api,
+                            allowed_chats=[42])
     n = bridge.poll_once()
     assert n == 1
     assert api.sent_msgs == [(42, "A desk and a window.")]
@@ -117,9 +120,80 @@ def test_bridge_skips_non_text_updates():
     api = FakeAPI([[
         {"update_id": 5, "message": {"chat": {"id": 1}}},   # no text (e.g. a sticker)
     ]])
-    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic([]), api=api)
+    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic([]), api=api,
+                            allowed_chats=[1])
     assert bridge.poll_once() == 0
     assert bridge._offset == 6 and api.sent_msgs == []
+
+
+# --- authorization (allowlist, fail-closed) --------------------------------
+def test_bridge_allowed_chat_is_dispatched():
+    script = [_Resp([_Block("text", text="hello there")], "end_turn")]
+    api = FakeAPI([[
+        {"update_id": 1, "message": {"chat": {"id": 7}, "text": "hi"}},
+    ]])
+    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic(script), api=api,
+                            allowed_chats=[7])
+    assert bridge.poll_once() == 1
+    assert api.sent_msgs == [(7, "hello there")]
+
+
+def test_bridge_disallowed_chat_is_ignored():
+    api = FakeAPI([[
+        {"update_id": 1, "message": {"chat": {"id": 999}, "text": "let me in"}},
+    ]])
+    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic([]), api=api,
+                            allowed_chats=[7])
+    assert bridge.poll_once() == 0          # not dispatched
+    assert api.sent_msgs == []
+    assert bridge._offset == 2              # but the offset still advances (don't re-poll it)
+
+
+def test_bridge_fails_closed_when_allowlist_empty():
+    events = []
+    api = FakeAPI([[
+        {"update_id": 1, "message": {"chat": {"id": 7}, "text": "hi"}},
+    ]])
+    bridge = TelegramBridge(FakeVerbs(), token="x", client=_FakeAnthropic([]), api=api,
+                            allowed_chats=[], on_event=events.append)
+    assert bridge.poll_once() == 0          # empty allowlist => deny all
+    assert api.sent_msgs == []
+    # exactly one fail-closed warning, even across chats/polls
+    assert sum("fail closed" in e for e in events) == 1
+
+
+def test_parse_allowed_chats():
+    assert _parse_allowed_chats("1, 2 ,3") == {1, 2, 3}
+    assert _parse_allowed_chats("") == set()
+    assert _parse_allowed_chats(None) == set()
+    assert _parse_allowed_chats("9, bad, 10") == {9, 10}   # junk ignored
+
+
+# --- token redaction --------------------------------------------------------
+def test_redact_token_scrubs_secret():
+    leaked = "404 Not Found for https://api.telegram.org/bot123456:AA-bcDEF_ghi/getUpdates"
+    out = redact_token(leaked)
+    assert "123456:AA-bcDEF_ghi" not in out
+    assert "bot***" in out
+
+
+def test_api_error_redacts_token():
+    import mini_plus_agent_kit.telegram as tg
+
+    class _Boom:
+        def get(self, *a, **k):
+            raise RuntimeError("connect error to https://api.telegram.org/bot77:SEKRET_tok/getUpdates")
+        def close(self):
+            pass
+
+    api = tg._TelegramAPI.__new__(tg._TelegramAPI)
+    api.base = "https://api.telegram.org/bot77:SEKRET_tok"
+    api._http = _Boom()
+    try:
+        api.get_updates()
+        assert False, "expected error"
+    except Exception as e:
+        assert "SEKRET_tok" not in str(e) and "bot***" in str(e)
 
 
 if __name__ == "__main__":

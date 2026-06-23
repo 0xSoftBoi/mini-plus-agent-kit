@@ -150,7 +150,9 @@ class PoseFilter:
         gx, gy = self.to_xy(lat, lon)
         # the fix describes where the rover was age_steps ago; compare it there
         bx, by = self.x, self.y
-        if age_steps > 0 and self._disp:
+        # only rewind when the buffer actually spans the fix's age; otherwise we'd
+        # silently rewind too few steps and fuse at the wrong pose — use current pose.
+        if age_steps > 0 and self._disp and age_steps <= len(self._disp):
             for dx, dy in self._disp[-age_steps:]:
                 bx -= dx
                 by -= dy

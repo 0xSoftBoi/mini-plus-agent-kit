@@ -19,6 +19,8 @@ injectable clients so the logic is testable without Telegram or Anthropic.
 from __future__ import annotations
 
 import base64
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -111,6 +113,31 @@ class RoverChat:
         return ChatReply(text=last_text or "(done)", images=images)
 
 
+# Matches ``bot<token>`` in any URL so the secret never leaks into logs/errors.
+_TOKEN_RE = re.compile(r"bot[0-9]+:[A-Za-z0-9_-]+")
+
+
+def redact_token(text: str) -> str:
+    """Strip the bot token out of any string (httpx puts the request URL in ``str(e)``)."""
+    return _TOKEN_RE.sub("bot***", str(text))
+
+
+def _parse_allowed_chats(raw: str | None) -> set[int]:
+    """Parse a comma-separated TELEGRAM_ALLOWED_CHATS value into a set of chat ids."""
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            pass
+    return out
+
+
 class _TelegramAPI:
     """Thin Telegram Bot API client (getUpdates / sendMessage / sendPhoto)."""
 
@@ -119,21 +146,30 @@ class _TelegramAPI:
         self._http = httpx.Client(timeout=timeout)
 
     def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
-        r = self._http.get(f"{self.base}/getUpdates",
-                           params={"offset": offset, "timeout": timeout})
-        r.raise_for_status()
+        try:
+            r = self._http.get(f"{self.base}/getUpdates",
+                               params={"offset": offset, "timeout": timeout})
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(redact_token(e)) from None
         return r.json().get("result", [])
 
     def send_message(self, chat_id: int, text: str) -> dict:
-        r = self._http.post(f"{self.base}/sendMessage", json={"chat_id": chat_id, "text": text})
-        r.raise_for_status()
+        try:
+            r = self._http.post(f"{self.base}/sendMessage", json={"chat_id": chat_id, "text": text})
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(redact_token(e)) from None
         return r.json()
 
     def send_photo(self, chat_id: int, photo: bytes, caption: str = "") -> dict:
-        r = self._http.post(f"{self.base}/sendPhoto",
-                            data={"chat_id": chat_id, "caption": caption},
-                            files={"photo": ("frame.jpg", photo, "image/jpeg")})
-        r.raise_for_status()
+        try:
+            r = self._http.post(f"{self.base}/sendPhoto",
+                                data={"chat_id": chat_id, "caption": caption},
+                                files={"photo": ("frame.jpg", photo, "image/jpeg")})
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(redact_token(e)) from None
         return r.json()
 
     def close(self) -> None:
@@ -153,6 +189,7 @@ class TelegramBridge:
         resource_name: str | None = None,
         api: _TelegramAPI | None = None,
         on_event: Callable[[str], None] | None = None,
+        allowed_chats: list[int] | set[int] | None = None,
     ):
         self.rover = rover
         self.client = client
@@ -160,8 +197,23 @@ class TelegramBridge:
         self.resource_name = resource_name
         self.api = api or _TelegramAPI(token)
         self.on_event = on_event or (lambda m: None)
+        if allowed_chats is None:
+            allowed_chats = _parse_allowed_chats(os.environ.get("TELEGRAM_ALLOWED_CHATS"))
+        self.allowed_chats: set[int] = set(allowed_chats)
+        self._warned_empty = False
         self._chats: dict[int, RoverChat] = {}
         self._offset: int | None = None
+
+    def _is_allowed(self, chat_id: int) -> bool:
+        """Authorize an inbound chat; FAIL CLOSED (deny all) if no allowlist is set."""
+        if not self.allowed_chats:
+            if not self._warned_empty:
+                self._warned_empty = True
+                self.on_event(
+                    "TELEGRAM_ALLOWED_CHATS is unset/empty — ignoring ALL messages "
+                    "(fail closed). Pass --allow-chat or set TELEGRAM_ALLOWED_CHATS.")
+            return False
+        return chat_id in self.allowed_chats
 
     def _chat_for(self, chat_id: int) -> RoverChat:
         if chat_id not in self._chats:
@@ -192,11 +244,14 @@ class TelegramBridge:
             chat_id = msg.get("chat", {}).get("id")
             if not text or chat_id is None:
                 continue
+            if not self._is_allowed(chat_id):
+                self.on_event(f"ignored message from unauthorized chat {chat_id}")
+                continue
             self.on_event(f"[{chat_id}] {text}")
             try:
                 self.handle(chat_id, text)
             except Exception as e:  # one bad message shouldn't kill the bot
-                self.on_event(f"error handling message: {e}")
+                self.on_event(f"error handling message: {redact_token(e)}")
             handled += 1
         return handled
 
@@ -208,4 +263,4 @@ class TelegramBridge:
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                self.on_event(f"poll error: {e}")
+                self.on_event(f"poll error: {redact_token(e)}")

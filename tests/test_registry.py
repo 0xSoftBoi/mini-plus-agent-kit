@@ -41,6 +41,18 @@ def test_tools_backcompat_shape():
     assert [t["name"] for t in TOOLS] == [v.name for v in VERBS]
 
 
+def test_drive_to_checkpoint_is_earthrover_only():
+    # The fused closed-loop controller is exposed as a verb on its own capability,
+    # gated to EarthRover (which has GPS + the fused controller) and not Harness.
+    v = _BY_NAME["drive_to_checkpoint"]
+    assert v.cap == "drive_to_checkpoint"
+    assert "drive_to_checkpoint" in EarthRoverVerbs.capabilities
+    assert "drive_to_checkpoint" not in HarnessVerbs.capabilities
+    er = {t["name"] for t in make_tools(EarthRoverVerbs.capabilities)}
+    hv = {t["name"] for t in make_tools(HarnessVerbs.capabilities)}
+    assert "drive_to_checkpoint" in er and "drive_to_checkpoint" not in hv
+
+
 def test_make_tools_strips_internal_and_filters():
     # _always always present; _work only when has_work; _cap never leaks.
     base = {t["name"] for t in make_tools(HarnessVerbs.capabilities, has_work=False)}

@@ -10,7 +10,7 @@ from mini_plus_agent_kit.estimator import (
 from mini_plus_agent_kit.geo import gps_course_and_speed
 from mini_plus_agent_kit.control import (
     HeadingPID, PursuitController, DistanceController, SafetyEnvelope, SafetyLimits,
-    NavController, DWAPlanner,
+    NavController, DWAPlanner, RegulatedPurePursuit,
 )
 from mini_plus_agent_kit.geo import heading_error_deg
 
@@ -65,6 +65,34 @@ def test_safety_envelope():
     assert not s.check(0.5, lidar_front_m=0.5).ok                  # TTC 1.0s ≤ 1.5 → stop
     slow = s.check(0.5, lidar_front_m=1.25); assert slow.ok and slow.scale < 1.0   # TTC 2.5s → slow
     assert s.check(0.5, battery=90, pitch=2, lidar_front_m=10).scale == 1.0         # clear
+    # v_scale_mps converts the normalized command to m/s: lidar 1.2 m, cmd 1.0 @ 0.6 m/s
+    # → ttc = 1.2 / 0.6 = 2.0 s, between min (1.5) and slow (3.0) → ok but scaled down
+    real = s.check(1.0, lidar_front_m=1.2, v_scale_mps=0.6)
+    assert real.ok and real.scale < 1.0 and abs(real.scale - 2.0 / 3.0) < 1e-6
+
+
+def test_rpp_empty_path_is_not_arrived():
+    rpp = RegulatedPurePursuit()
+    # an empty path is "no goal", not "arrived" → hold still, arrived=False
+    c = rpp.step(0.0, 0.0, 30.0, [])
+    assert not c.arrived and c.linear == 0.0 and c.angular == 0.0
+
+
+def test_posefilter_latency_rewind_skipped_when_buffer_too_short():
+    # age beyond what the buffer spans → skip rewind, fuse at current pose
+    pf = PoseFilter(37.0, -122.0, sigma_gps_m=1.0, p0=4.0, latency_buffer=25)
+    for _ in range(3):
+        pf.predict(1.0, 0.0)               # only 3 displacements buffered
+    here = pf.latlon()
+    pf.correct_gps(*here, age_steps=10)     # asks to rewind 10 > 3 → uses current pose
+    assert abs(pf.xy()[1] - 3.0) < 1e-6     # fix at current pose → no drag back
+    # behavior identical when the buffer spans the age (rewind happens normally)
+    pf2 = PoseFilter(37.0, -122.0, sigma_gps_m=1.0, p0=4.0, latency_buffer=25)
+    for _ in range(10):
+        pf2.predict(1.0, 0.0)
+    five_ago = (37.0 + 5.0 / 111_320.0, -122.0)
+    pf2.correct_gps(*five_ago, age_steps=5)
+    assert pf2.xy()[1] > 8.0                 # rewound correctly, stayed near truth
 
 
 def test_posefilter_kalman_gain_and_outlier_gate():

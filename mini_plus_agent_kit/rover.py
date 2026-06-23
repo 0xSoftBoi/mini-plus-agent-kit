@@ -95,6 +95,10 @@ class RoverVerbs(ABC):
     def checkpoint_reached(self) -> dict:
         raise EarthRoverError(501, f"{self.name}: checkpoints are not supported")
 
+    def drive_to_checkpoint(self, max_steps: int | None = None) -> dict:
+        raise NotImplementedError(
+            f"{self.name}: fused closed-loop checkpoint controller is not supported")
+
     def close(self) -> None:  # pragma: no cover - thin
         pass
 
@@ -109,7 +113,7 @@ class EarthRoverVerbs(RoverVerbs):
     # checkpoints → real waypoint navigation (Earth Rover Challenge Urban track).
     capabilities = frozenset(
         {"status_report", "move", "turn", "look", "photo", "speak",
-         "track_color", "autonav", "lamp", "navigate"}
+         "track_color", "autonav", "lamp", "navigate", "drive_to_checkpoint"}
     )
 
     def __init__(self, client: EarthRoverClient):
@@ -158,6 +162,16 @@ class EarthRoverVerbs(RoverVerbs):
 
     def checkpoint_reached(self) -> dict:
         return self.client.checkpoint_reached()
+
+    def drive_to_checkpoint(self, max_steps: int | None = None) -> dict:
+        """Run the fused closed-loop controller to the next checkpoint.
+
+        Thin agent-facing wrapper over :meth:`goto_checkpoint_fused` (the
+        production autonomy path); ``max_steps=None`` keeps that method's default.
+        """
+        if max_steps is None:
+            return self.goto_checkpoint_fused()
+        return self.goto_checkpoint_fused(max_steps=max_steps)
 
     def navigate(self) -> dict:
         """GPS guidance to the next checkpoint (Earth Rover Challenge Urban track).

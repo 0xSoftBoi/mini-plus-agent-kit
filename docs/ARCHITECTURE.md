@@ -682,10 +682,10 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 66 tests (stubbed httpx / anthropic)"]
+  subgraph H["Hermetic suite (stubbed httpx / anthropic)"]
     HU["units · geo · registry · verbs · work (BitRobot/Arc/Solana) · tools · agent-loop · mcp<br/>telegram · actuators · navstack · planner · estimator refinements · sim scenarios"]
   end
-  subgraph L["Live suite &mdash; 12 tests (real I/O, no stubs)"]
+  subgraph L["Live suite (real I/O, no stubs)"]
     L1["harness · mcp · track_color · navigate"]
     L5["navstack: fused vs bang-bang, noisy sim"]
     L6["heading: GPS-course rescues biased mag"]
