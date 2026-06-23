@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -35,6 +36,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+from .observability import get_logger
 
 WALRUS_PUBLISHER = os.environ.get(
     "WALRUS_PUBLISHER", "https://publisher.walrus-testnet.walrus.space"
@@ -615,15 +618,25 @@ def submit_work(
     start → store(Walrus + CID + sha256) → end(raw_data_uri/cid) → validate.
     Returns a :class:`WorkRecord` with the artifact and per-stage responses.
     """
+    log = get_logger()
     event_id = event_id or f"mpak-{uuid.uuid4().hex}"
     artifact = store_artifact(data, content_type=content_type)
+    log.info(json.dumps({"type": "artifact", "event_id": event_id, "label": label,
+                         "sha256": artifact.sha256, "cid": artifact.ipfs_cid,
+                         "blobId": artifact.walrus_blob_id, "bytes": artifact.byte_length},
+                        sort_keys=True))
     start = sink.task_start(event_id, resource_name=resource_name,
                             resource_subtype=resource_subtype, task_id=task_id)
     run_ref = _run_ref(start, event_id)
     end = sink.task_end(run_ref, artifact, label=label)
     validate = sink.task_validate(run_ref, vrw_points)
-    return WorkRecord(event_id, run_ref, artifact, label, vrw_points,
-                      {"start": start, "end": end, "validate": validate})
+    rec = WorkRecord(event_id, run_ref, artifact, label, vrw_points,
+                     {"start": start, "end": end, "validate": validate})
+    # audit the on-chain anchor outcome (tx / signature / explorer when present)
+    log.info(json.dumps({"type": "anchor", "event_id": event_id, "run_ref": run_ref,
+                         "ok": rec.ok, "vrw_points": vrw_points, "validate": validate},
+                        default=str, sort_keys=True))
+    return rec
 
 
 def _run_ref(start_response: Any, fallback: str) -> str:

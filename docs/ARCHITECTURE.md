@@ -167,6 +167,44 @@ sequenceDiagram
 ```
 *Figure 4 — Agent control loop (the Telegram and MCP front-ends reuse `dispatch`).*
 
+### 5.1 Observability & mission safety
+
+A system that moves a physical robot and writes money/reputation on-chain must be
+**auditable** and **fail-safe**. Two cross-cutting layers wrap the loop:
+
+**Observability (`observability.py`).** Every mission is a `Run` — an append-only,
+structured event timeline (`run_start` → `verb` / `verb_result` → `timing` →
+`emergency_stop` / `safety_trip` → `run_end`) plus counters and per-verb timers,
+serializable to a JSON **manifest** attached to `RunResult.manifest` (and optionally
+saved via `MPAK_MANIFEST_PATH`). The manifest is the source of truth — after a
+disputed on-chain write or a misbehaving mission you can replay exactly what
+happened (objective → which verb → which artifact CID/sha → which tx). `submit_work`
+also logs `artifact` and `anchor` events so the VRW pipeline is auditable on its own.
+Python `logging` is a level-gated mirror (quiet by default; `MPAK_LOG_LEVEL=INFO`).
+
+**Mission safety (`safety.py`).** `control.SafetyEnvelope` gates a *single* command;
+the mission needs an outer layer:
+- `SafetySupervisor` — a **latching** check of whole-mission budgets the per-step
+  envelope can't see: runtime, cumulative distance, a geofence (`haversine` from a
+  center), and a battery floor. Checked each turn of the agent loop (runtime) and
+  each step of `goto_checkpoint_fused` (distance / battery / geofence) → stop on breach.
+- `Watchdog` — a **deadman timer on its own thread**. The loop must `pet()` it each
+  iteration; if a turn hangs (a blocked LLM call, a wedged transport) and it goes
+  un-pet past `watchdog_timeout_s`, it fires an emergency stop *exactly once* — the
+  guarantee a synchronous agent loop otherwise lacks (a hung `messages.create` would
+  leave a moving robot unattended). The stop prefers a latching `estop()` over `stop()`.
+
+```mermaid
+flowchart LR
+  LOOP["agent loop / control loop"] -->|pet each iter| WD["Watchdog thread"]
+  LOOP -->|check budgets| SUP["SafetySupervisor<br/>runtime, distance, geofence, battery"]
+  WD -->|un-pet > timeout| ESTOP["emergency_stop (estop then stop)"]
+  SUP -->|breach latches| ESTOP
+  LOOP -->|events| RUN["Run manifest<br/>verb, artifact, tx, safety"]
+  ESTOP --> RUN
+```
+*Figure 4b — observability + mission-safety layers around the loop.*
+
 ---
 
 ## 6. Robot abstraction and kinematics
@@ -624,9 +662,14 @@ graph TD
   planner --> rover
   control --> sim["sim.py"]
   geo --> sim
+  geo --> safety["safety.py"]
+  safety --> rover
   client["client.py"] --> rover
   harness["harness_client.py"] --> rover
   client --> work["work.py"]
+  obs["observability.py"] --> work
+  obs --> agent
+  safety --> agent
   rover --> tools["tools.py"]
   work --> tools
   tools --> agent["agent.py"]
@@ -683,7 +726,7 @@ testnet) — no robot or keys required.
 ```mermaid
 flowchart TB
   subgraph H["Hermetic suite (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work (BitRobot/Arc/Solana) · tools · agent-loop · mcp<br/>telegram · actuators · navstack · planner · estimator refinements · sim scenarios"]
+    HU["units · geo · registry · verbs · work (BitRobot/Arc/Solana) · tools · agent-loop · mcp · telegram<br/>actuators · navstack · planner · estimator refinements · sim scenarios · observability · safety"]
   end
   subgraph L["Live suite (real I/O, no stubs)"]
     L1["harness · mcp · track_color · navigate"]

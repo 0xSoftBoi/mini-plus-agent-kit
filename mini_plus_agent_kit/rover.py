@@ -28,6 +28,7 @@ from typing import Any
 from .client import EarthRoverClient, EarthRoverError, Telemetry
 from .geo import haversine_m, initial_bearing_deg, heading_error_deg
 from .harness_client import HarnessClient
+from .safety import SafetySupervisor
 
 CHECKPOINT_TOLERANCE_M = 15.0  # Earth Rover Challenge Urban-track GPS tolerance
 
@@ -229,15 +230,18 @@ class EarthRoverVerbs(RoverVerbs):
         return {"ok": False, "reason": "max_steps", "last": last}
 
     def goto_checkpoint_fused(self, max_steps: int = 400, dt: float = 0.25,
-                              v_scale_mps: float = 0.6) -> dict:
+                              v_scale_mps: float = 0.6,
+                              supervisor: SafetySupervisor | None = None) -> dict:
         """Closed-loop *fused* waypoint controller — the production autonomy path.
 
         Where ``goto_checkpoint`` is bang-bang on raw GPS+heading, this runs the
         navigation stack: heading fusion (orientation/IMU), pose fusion (commanded-
-        velocity odometry corrected by GPS), pursuit steering, and a safety envelope
-        (battery / tilt / lidar time-to-collision), emitting a smoothed twist each
-        loop via ``/control``. Proven to reach the checkpoint where the bang-bang
-        baseline false-arrives under GPS noise (``tests/live/test_live_navstack.py``).
+        velocity odometry corrected by GPS), pursuit steering, and a per-step safety
+        envelope (battery / tilt / lidar TTC), emitting a smoothed twist each loop via
+        ``/control``. A mission-level :class:`SafetySupervisor` additionally enforces
+        runtime / distance / geofence / battery budgets and stops on a breach. Proven
+        to reach the checkpoint where the bang-bang baseline false-arrives under GPS
+        noise (``tests/live/test_live_navstack.py``).
         """
         from .control import NavController
 
@@ -254,9 +258,21 @@ class EarthRoverVerbs(RoverVerbs):
         glat, glon = float(nxt["latitude"]), float(nxt["longitude"])
         nav = NavController(t.latitude, t.longitude,
                             tol_m=CHECKPOINT_TOLERANCE_M, v_scale_mps=v_scale_mps)
+        sup = supervisor or SafetySupervisor()
+        prev_ll = (t.latitude, t.longitude)
+        traveled = 0.0
         last = {}
         for step in range(1, max_steps + 1):
             t = self.client.data()
+            if t.latitude is not None and t.longitude is not None:
+                traveled += haversine_m(prev_ll[0], prev_ll[1], t.latitude, t.longitude)
+                prev_ll = (t.latitude, t.longitude)
+            verdict = sup.check(battery=t.battery, lat=t.latitude, lon=t.longitude,
+                                distance_m=traveled)
+            if not verdict.ok:                            # mission budget breach → stop
+                self.client.stop()
+                return {"ok": False, "reason": f"safety: {verdict.reason}",
+                        "controller": "fused", "steps": step, "distance_m": round(traveled, 1)}
             s = nav.step(dt, heading_deg=t.orientation or 0.0, goal_lat=glat, goal_lon=glon,
                          lat=t.latitude, lon=t.longitude, lidar_front_m=t.lidar_front_m,
                          battery=t.battery, estop=bool(t.estop))

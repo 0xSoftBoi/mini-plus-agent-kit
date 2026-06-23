@@ -127,7 +127,43 @@ def test_max_tokens_continues_turn():
     assert "Continue" in follow_up and "tool" not in follow_up.lower()
 
 
+def test_run_produces_manifest():
+    # the run records an auditable manifest: run_start -> verb -> run_end + counters
+    script = [_Resp([_tu("finish", {"success": True, "reason": "done"}, "t1")], "tool_use")]
+    verbs = FakeVerbs()
+    agent = MiniPlusAgent(verbs, client=_FakeAnthropic(script), on_event=lambda *_: None,
+                          watchdog_timeout_s=0)
+    res = agent.run("do it")
+    m = res.manifest
+    assert res.run_id and m["run_id"] == res.run_id
+    types = [e["type"] for e in m["events"]]
+    assert types[0] == "run_start" and types[-1] == "run_end"
+    assert "verb" in types and any(e.get("name") == "finish" for e in m["events"])
+    assert m["counters"].get("verbs", 0) >= 1
+
+
+def test_watchdog_emergency_stops_hung_turn():
+    # a turn that blocks past the watchdog timeout must trigger an emergency stop
+    import time
+
+    class _Hung:
+        def __init__(self): self.messages = self
+        def create(self, **kw):
+            time.sleep(0.3)                       # simulate a wedged LLM call
+            return _Resp([_tu("finish", {"success": True, "reason": "late"}, "t1")], "tool_use")
+
+    verbs = FakeVerbs()
+    agent = MiniPlusAgent(verbs, client=_Hung(), on_event=lambda *_: None,
+                          watchdog_timeout_s=0.1)
+    res = agent.run("go")
+    assert res.reason.startswith("watchdog")          # loop stalled, not a normal finish
+    assert "stop" in verbs.calls                      # emergency stop fired
+    assert any(e["type"] == "watchdog_fired" for e in res.manifest["events"])
+
+
 if __name__ == "__main__":
     main()
     test_max_tokens_continues_turn()
+    test_run_produces_manifest()
+    test_watchdog_emergency_stops_hung_turn()
     print("agent-loop e2e: PASS")

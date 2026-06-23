@@ -23,6 +23,8 @@ from .work import (
     ipfs_cid, cid_v1_raw, solana_explorer_tx,
 )
 from .agent import MiniPlusAgent, RunResult, load_system_prompt, DEFAULT_MODEL
+from .observability import Run, get_logger
+from .safety import SafetySupervisor, MissionLimits, Watchdog
 from .tools import TOOLS, make_tools, dispatch
 from .telegram import RoverChat, TelegramBridge, ChatReply
 from .mcp_server import build_mcp_server, run_stdio, serve
@@ -40,6 +42,8 @@ __all__ = [
     "ipfs_cid", "cid_v1_raw", "solana_explorer_tx",
     # agent
     "MiniPlusAgent", "RunResult", "load_system_prompt", "DEFAULT_MODEL",
+    # observability + safety
+    "Run", "get_logger", "SafetySupervisor", "MissionLimits", "Watchdog",
     # chat surface
     "RoverChat", "TelegramBridge", "ChatReply",
     # MCP server (drive from any MCP client)

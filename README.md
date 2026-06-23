@@ -349,7 +349,9 @@ mini_plus_agent_kit/
   planner.py         Costmap + A*        — global path planning around obstacles
   sim.py             RoverSim + SensorModel — unified simulator for domain-randomized MC
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
-  agent.py           MiniPlusAgent      — Claude loop + instruction-file prompt
+  agent.py           MiniPlusAgent      — Claude loop + run manifest + safety supervisor/watchdog
+  observability.py   Run                — structured event log + JSON run manifest
+  safety.py          SafetySupervisor/Watchdog — mission budgets + deadman emergency-stop
   tools.py           verb tools + dispatch
   telegram.py        RoverChat + TelegramBridge — chat surface (openClaw demo)
   mcp_server.py      MCP server over the same make_tools()+dispatch() core
@@ -391,6 +393,18 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • solana: real httpx → emulated clanker5000 sidecar (give_feedback signature + explorer)
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
+
+## Observability & mission safety
+
+Every mission produces an auditable **run manifest** (`observability.Run`) — a
+structured event timeline (objective → verb → artifact CID/sha → on-chain tx →
+safety events) + counters/timers, attached to `RunResult.manifest` (save with
+`MPAK_MANIFEST_PATH`; live stream with `MPAK_LOG_LEVEL=INFO`). Two safety layers wrap
+the loop beyond the per-command `SafetyEnvelope`: a **`SafetySupervisor`** enforcing
+mission budgets (runtime, cumulative distance, geofence, battery — latching on
+breach), and a **deadman `Watchdog`** thread that emergency-stops the robot if a turn
+hangs (e.g. a blocked LLM call) and the loop stops petting it. Configure via
+`MiniPlusAgent(..., limits=MissionLimits(...), watchdog_timeout_s=120)`.
 
 ## Safety
 
