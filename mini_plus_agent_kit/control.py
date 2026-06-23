@@ -100,6 +100,90 @@ class PursuitController:
 
 
 # --------------------------------------------------------------------------- #
+# Regulated pure pursuit (path tracking)
+# --------------------------------------------------------------------------- #
+class RegulatedPurePursuit:
+    """Track a polyline path with pure-pursuit steering + Nav2-style speed regulation.
+
+    Unlike `PursuitController` (steers at a *single* waypoint), this follows a planned
+    path that routes around obstacles. Each step: find the closest point on the path,
+    advance a velocity-scaled **lookahead distance** ``L = clamp(t_la·v, L_min, L_max)``
+    to a lookahead point, and steer by the pure-pursuit curvature
+    ``κ = 2·sin(α)/L`` (α = signed bearing error to that point). Linear speed is then
+    **regulated** down on (a) sharp curvature (turn radius ``r = 1/|κ| < r_min``),
+    (b) approach to the final goal, and (c) — when a cost lookup is supplied — proximity
+    to obstacles. Plain pure pursuit oscillates/fails above ~1.5 m/s; these regulators
+    are what make it track accurately. Ref: Nav2 ``regulated_pure_pursuit``.
+    """
+
+    def __init__(self, v_max: float = 0.6, lookahead_time: float = 1.5,
+                 min_lookahead: float = 2.0, max_lookahead: float = 12.0,
+                 regulation_min_radius: float = 4.0, approach_dist: float = 6.0,
+                 tol_m: float = 15.0, min_speed: float = 0.1,
+                 curvature_to_cmd: float = 2.0):
+        self.v_max = v_max
+        self.lookahead_time = lookahead_time
+        self.min_lookahead, self.max_lookahead = min_lookahead, max_lookahead
+        self.regulation_min_radius = regulation_min_radius
+        self.approach_dist = approach_dist
+        self.tol_m, self.min_speed = tol_m, min_speed
+        self.curvature_to_cmd = curvature_to_cmd
+
+    def _lookahead_point(self, x, y, path, L):
+        """Closest point on the path, then march ``L`` metres forward along it."""
+        # closest projection over all segments
+        best_d2, best_i, best_pt = float("inf"), 0, path[0]
+        for i in range(len(path) - 1):
+            ax, ay = path[i]
+            bx, by = path[i + 1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy or 1e-9
+            t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg2))
+            px, py = ax + t * dx, ay + t * dy
+            d2 = (x - px) ** 2 + (y - py) ** 2
+            if d2 < best_d2:
+                best_d2, best_i, best_pt = d2, i, (px, py)
+        # walk forward L metres from the projection
+        remaining = L
+        cur = best_pt
+        for i in range(best_i, len(path) - 1):
+            nxt = path[i + 1]
+            seg = math.hypot(nxt[0] - cur[0], nxt[1] - cur[1])
+            if seg >= remaining:
+                f = remaining / seg if seg else 1.0
+                return (cur[0] + (nxt[0] - cur[0]) * f, cur[1] + (nxt[1] - cur[1]) * f)
+            remaining -= seg
+            cur = nxt
+        return path[-1]
+
+    def step(self, x: float, y: float, heading_deg: float,
+             path: list, v_now: float | None = None) -> Cmd:
+        if not path:
+            return Cmd(0.0, 0.0, 0.0, heading_deg, 0.0, True)
+        gx, gy = path[-1]
+        dist_goal = math.hypot(gx - x, gy - y)
+        v = self.v_max if v_now is None else max(self.min_speed, v_now)
+        L = _clamp(self.lookahead_time * v, self.min_lookahead, self.max_lookahead)
+        lx, ly = self._lookahead_point(x, y, path, L)
+        bearing = math.degrees(math.atan2(lx - x, ly - y)) % 360.0
+        err = heading_error_deg(heading_deg, bearing)
+        if dist_goal <= self.tol_m:
+            return Cmd(0.0, 0.0, dist_goal, bearing, err, True)
+        a = math.radians(err)
+        ld = max(math.hypot(lx - x, ly - y), 1e-3)
+        kappa = 2.0 * math.sin(a) / ld                       # pure-pursuit curvature
+        angular = _clamp(-self.curvature_to_cmd * kappa, -1.0, 1.0)   # ROS sign (neg = right)
+        # --- speed regulation ---
+        v_cmd = self.v_max
+        radius = (1.0 / abs(kappa)) if abs(kappa) > 1e-6 else math.inf
+        if radius < self.regulation_min_radius:              # (a) curvature
+            v_cmd *= max(0.15, radius / self.regulation_min_radius)
+        v_cmd = min(v_cmd, self.v_max * min(1.0, dist_goal / self.approach_dist))  # (b) approach
+        linear = max(self.min_speed if abs(err) < 90.0 else 0.0, v_cmd)
+        return Cmd(linear, angular, dist_goal, bearing, err, False)
+
+
+# --------------------------------------------------------------------------- #
 # Odometry distance controller
 # --------------------------------------------------------------------------- #
 class DistanceController:
@@ -198,14 +282,23 @@ class NavController:
 
     def __init__(self, base_lat: float, base_lon: float, *, v_max: float = 0.6,
                  k_ang: float = 1.6, slow_radius_m: float = 8.0, tol_m: float = 15.0,
-                 v_scale_mps: float = 0.6, limits: SafetyLimits | None = None):
+                 v_scale_mps: float = 0.6, limits: SafetyLimits | None = None,
+                 use_rpp: bool = False):
         self.hf = HeadingFilter()
         self.pf = PoseFilter(base_lat, base_lon)
         self.pp = PursuitController(v_max=v_max, k_ang=k_ang,
                                     slow_radius_m=slow_radius_m, tol_m=tol_m)
+        self.rpp = RegulatedPurePursuit(v_max=v_max, tol_m=tol_m) if use_rpp else None
+        self.path: list | None = None       # ENU world points from the global planner
         self.safety = SafetyEnvelope(limits)
         self.v_scale_mps = v_scale_mps
         self._last_v = 0.0
+
+    def set_path(self, path_xy: list) -> None:
+        """Track this planned ENU path (from ``planner.plan_path``) with regulated pure pursuit."""
+        if self.rpp is None:
+            self.rpp = RegulatedPurePursuit(v_max=self.pp.v_max, tol_m=self.pp.tol_m)
+        self.path = path_xy
 
     def step(self, dt: float, *, heading_deg: float, goal_lat: float, goal_lon: float,
              lat: float | None = None, lon: float | None = None,
@@ -222,8 +315,11 @@ class NavController:
         if lat is not None and lon is not None:
             gps_rejected = not self.pf.correct_gps(lat, lon)
         x, y = self.pf.xy()
-        gx, gy = self.pf.to_xy(goal_lat, goal_lon)
-        cmd = self.pp.step(x, y, hhat, gx, gy)
+        if self.path and self.rpp is not None:               # track the planned path
+            cmd = self.rpp.step(x, y, hhat, self.path)
+        else:                                                # seek the single waypoint
+            gx, gy = self.pf.to_xy(goal_lat, goal_lon)
+            cmd = self.pp.step(x, y, hhat, gx, gy)
         verdict = self.safety.check(cmd.linear, battery=battery, roll=roll, pitch=pitch,
                                     lidar_front_m=lidar_front_m, estop=estop)
         linear = cmd.linear * verdict.scale if verdict.ok else 0.0

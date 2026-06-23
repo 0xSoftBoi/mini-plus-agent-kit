@@ -274,10 +274,18 @@ SDK), with real GPS waypoint navigation:
   the checkpoint (a miss at 15 m tolerance) while the fused stack *gates every
   outlier*, *truly arrives* (14.9 m), and tracks heading 2.2× better than the raw
   magnetometer. See [§7.1 of the architecture spec](docs/ARCHITECTURE.md#71-closed-loop-fused-navigation-sensor-fusion--pursuit--safety).
+- `EarthRoverVerbs.goto_checkpoint_planned(costmap)` — the **global+local split**
+  (Nav2-style): A\* over an inflated occupancy `Costmap` (`planner.py`) finds a path
+  *around* obstacles, tracked by **regulated pure pursuit** (velocity-scaled
+  lookahead + curvature/approach speed regulation). A straight-line seeker drives
+  into anything between it and the goal; in the sim it ploughs through a building
+  for 46 ticks while the planned route reaches the checkpoint with **0 incursions**.
+  See [§7.2](docs/ARCHITECTURE.md#72-global-planning-around-obstacles-a--regulated-pure-pursuit).
 
 The live tests drive a 2D kinematic rover sim over real HTTP to a GPS checkpoint
-(`tests/live/test_live_navigate.py`) and run the fused-vs-baseline A/B under
-sensor noise (`tests/live/test_live_navstack.py`).
+(`tests/live/test_live_navigate.py`), run the fused-vs-baseline A/B under sensor
+noise + GPS multipath (`tests/live/test_live_navstack.py`), and route around an
+obstacle with A\* + regulated pursuit (`tests/live/test_live_planner.py`).
 
 ## Waveshare as a LeRobot robot
 
@@ -297,7 +305,8 @@ mini_plus_agent_kit/
   harness_client.py  HarnessClient      — Waveshare robot-harness transport
   rover.py           RoverVerbs         — openClaw verb surface (2 backends)
   estimator.py       HeadingFilter/PoseFilter — Mahony heading + Kalman GPS pose fusion
-  control.py         NavController       — pursuit + PID + safety closed-loop stack
+  control.py         NavController       — pursuit + PID + regulated-pure-pursuit + safety
+  planner.py         Costmap + A*        — global path planning around obstacles
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
   agent.py           MiniPlusAgent      — Claude loop + instruction-file prompt
   tools.py           verb tools + dispatch
@@ -313,10 +322,11 @@ mini_plus_agent_kit/
 A hermetic suite (no robot, no network, no real SDKs — `httpx`/`anthropic` are
 stubbed) covers kinematics, telemetry mapping, IPFS CID, capability-filtered
 tools, the openClaw verb→endpoint wiring, the navigation stack (filters,
-controllers, safety), all three work sinks, and a full scripted agent-loop run:
+controllers, safety, costmap + A* planner), all three work sinks, and a full
+scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 49 passed
+python3 tests/run_all.py     # zero-dependency runner  → 54 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -332,6 +342,7 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • real GPS navigate: the goto_checkpoint controller reaches a checkpoint in a sim
 #  • navstack A/B: fused NavController (Kalman + Mahalanobis gating) truly arrives and rejects
 #    GPS multipath where the bang-bang baseline false-arrives 34.6 m out
+#  • planner: A* over a costmap + regulated pure pursuit routes around a building (0 incursions)
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
 

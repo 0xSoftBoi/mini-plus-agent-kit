@@ -258,6 +258,53 @@ class EarthRoverVerbs(RoverVerbs):
         self.client.stop()
         return {"ok": False, "reason": "max_steps", "controller": "fused", "last": last}
 
+    def goto_checkpoint_planned(self, costmap, max_steps: int = 600, dt: float = 0.25,
+                                v_scale_mps: float = 0.6) -> dict:
+        """Plan a path *around obstacles* (A* over ``costmap``), then track it.
+
+        The Nav2-style global+local split: ``costmap`` is a ``planner.Costmap`` in the
+        rover's local-ENU frame (origin = the rover's pose at call time), populated by
+        the caller from whatever obstacle sense the platform exposes (camera-derived
+        occupancy, a known site map; the Earth Rover SDK only gives 1-D front lidar).
+        A straight-line waypoint seeker drives into anything between it and the goal;
+        this routes around it with regulated pure pursuit. Falls back to the
+        closed-loop straight-line controller if no route is found.
+        """
+        from .control import NavController
+        from .planner import plan_path
+
+        t = self.client.data()
+        if t.latitude is None or t.longitude is None:
+            raise EarthRoverError(409, "no GPS fix")
+        cps = self.client.checkpoints()
+        scanned = cps.get("latest_scanned_checkpoint") or 0
+        nxt = next((c for c in sorted(cps.get("checkpoints_list", []),
+                                      key=lambda c: c.get("sequence", 0))
+                    if c.get("sequence", 0) > scanned), None)
+        if nxt is None:
+            return {"done": True, "reply": "all checkpoints scanned — mission complete"}
+        glat, glon = float(nxt["latitude"]), float(nxt["longitude"])
+        nav = NavController(t.latitude, t.longitude, tol_m=CHECKPOINT_TOLERANCE_M,
+                            v_scale_mps=v_scale_mps, use_rpp=True)
+        path = plan_path(costmap, (0.0, 0.0), nav.pf.to_xy(glat, glon))
+        if not path:                                    # unreachable on the costmap
+            return self.goto_checkpoint_fused(max_steps=max_steps, dt=dt, v_scale_mps=v_scale_mps)
+        nav.set_path(path)
+        for step in range(1, max_steps + 1):
+            t = self.client.data()
+            s = nav.step(dt, heading_deg=t.orientation or 0.0, goal_lat=glat, goal_lon=glon,
+                         lat=t.latitude, lon=t.longitude, lidar_front_m=t.lidar_front_m,
+                         battery=t.battery, estop=bool(t.estop))
+            if s.arrived:
+                self.client.stop()
+                res = self.client.checkpoint_reached()
+                return {"ok": True, "reached": nxt.get("sequence"), "steps": step,
+                        "controller": "planned", "waypoints": len(path), "result": res}
+            self.client.control(s.linear, s.angular)
+            time.sleep(dt)
+        self.client.stop()
+        return {"ok": False, "reason": "max_steps", "controller": "planned", "waypoints": len(path)}
+
     def stop(self) -> dict:
         return self.client.stop()
 

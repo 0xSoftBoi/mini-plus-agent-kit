@@ -330,6 +330,54 @@ multipath spike near the goal makes it **declare arrival 34.6 m from the checkpo
 **Mahalanobis-gates every injected multipath outlier**, tracks heading **2.2×
 better than the raw magnetometer**, and **truly arrives within tolerance (14.9 m)**.
 
+### 7.2 Global planning around obstacles (A* + regulated pure pursuit)
+
+§7.1 still *seeks the waypoint in a straight line* — it drives into any building,
+curb, or blocked sidewalk between the rover and the checkpoint. The standard fix
+(ROS Nav2) splits navigation into a **global planner** that searches a path over a
+costmap and a **local controller** that tracks it. The kit implements both
+(`planner.py` + `control.RegulatedPurePursuit`), wired through
+`EarthRoverVerbs.goto_checkpoint_planned(costmap)`.
+
+```mermaid
+flowchart LR
+  GOAL["next checkpoint (GPS goal)"] --> PLAN
+  CM["Costmap<br/>occupancy + inflation"] --> PLAN["A* global planner<br/>8-conn, clearance cost,<br/>string-pull smoothing"]
+  PLAN -->|path| RPP["RegulatedPurePursuit<br/>velocity-scaled lookahead +<br/>curvature/approach regulation"]
+  POSE["fused pose (Kalman, 7.1)"] --> RPP
+  RPP --> SAFE["SafetyEnvelope"]
+  SAFE -->|twist| ROB["/control linear, angular"]
+```
+*Figure 6c — global planner → local tracker, the Nav2 split.*
+
+**Global planner (`planner.py`).** A `Costmap` is an inflated occupancy grid in the
+rover's local-ENU frame: obstacles are marked lethal and `inflate(r)` rings them
+with a linearly-decaying cost so paths keep clearance. `plan_path` runs 8-connected
+**A\*** with step cost $1+\text{cell\_cost}/50$ (it trades a little length for
+clearance), forbids diagonal corner-cuts through lethal cells, and **string-pulls**
+the staircase result to the minimal set of waypoints — where the smoothing chord
+test respects the inflation layer (threshold $\tfrac{1}{2}\text{LETHAL}$), so it
+keeps clearance instead of hugging the wall edge (which a corner-cutting tracker
+would then clip).
+
+**Local tracker (`RegulatedPurePursuit`).** Plain pure pursuit *"shows complete
+failure with dramatic oscillations at 1.5 m/s"* [RPP]. The regulated variant
+projects the robot onto the path, advances a **velocity-scaled lookahead**
+$L=\operatorname{clamp}(t_\text{la}\,v,\,L_\text{min},\,L_\text{max})$ to a lookahead
+point, steers by the pure-pursuit curvature $\kappa=2\sin\alpha/L$, then **regulates
+speed**: down on sharp curvature (turn radius $r=1/|\kappa|<r_\text{min}$, scale
+$r/r_\text{min}$) and on final-goal approach (scale $d/d_\text{approach}$) — then the
+`SafetyEnvelope` (§7.1) gates the result.
+
+**Why it matters (validated).** In `tests/live/test_live_planner.py` a building
+straddles the straight line to the checkpoint. The naive straight-line seeker
+**drives through the building for 46 ticks**; the planned route (A\* finds a 69 m
+path vs the 60 m straight shot) is tracked with **zero obstacle incursions** and
+reaches the goal. The costmap is *brought by the caller* — populated from the
+platform's obstacle sense (camera-derived occupancy, a site map); the Earth Rover
+SDK exposes only 1-D front lidar, so there the reactive `SafetyEnvelope` remains the
+last line of defence and this is the framework for richer obstacle data.
+
 ---
 
 ## 8. Visual servoing: `track_color`
@@ -437,7 +485,9 @@ graph TD
   geo --> estimator["estimator.py"]
   geo --> control["control.py"]
   estimator --> control
+  planner["planner.py"] --> control
   control --> rover
+  planner --> rover
   client["client.py"] --> rover
   harness["harness_client.py"] --> rover
   client --> work["work.py"]
@@ -496,16 +546,17 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 49 tests (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack"]
+  subgraph H["Hermetic suite &mdash; 54 tests (stubbed httpx / anthropic)"]
+    HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack · planner"]
   end
-  subgraph L["Live suite &mdash; 6 tests (real I/O, no stubs)"]
+  subgraph L["Live suite &mdash; 7 tests (real I/O, no stubs)"]
     L1["harness: real httpx &harr; HTTP emulator"]
     L2["mcp: real protocol &harr; dispatch"]
     L3["track_color: real HSV on generated JPEG"]
     L4["navigate: real geo &harr; kinematic sim"]
     L5["navstack: fused vs bang-bang, noisy sim"]
-    L6["walrus: real testnet store + retrieve"]
+    L6["planner: A* + reg. pursuit around obstacle"]
+    L7["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
@@ -517,6 +568,7 @@ flowchart TB
 | track_color | real HSV detection + servo on real generated JPEGs (right-blob → turn-right; arrival stop) |
 | navigate | real geo + the `goto_checkpoint` controller converging to a checkpoint (65 m → 9 m) in a 2-D kinematic sim |
 | navstack | fused `NavController` (Kalman pose filter + Mahalanobis gating) vs bang-bang baseline on the same noisy truth incl. GPS multipath: baseline false-arrives 34.6 m out; fused gates every outlier, arrives truly (14.9 m), heading 2.2× better than raw mag |
+| planner | A\* over an inflated costmap + regulated pure pursuit vs straight-line seeking: naive drives through a building (46 ticks inside); planned route (69 m vs 60 m straight) reaches the goal with 0 incursions |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
 
 > **Scope of validation.** The plumbing, protocols, content-addressing, geometry,
@@ -544,3 +596,6 @@ mission; the kit provides the policy.
 - BitRobot subnet API — `docs.bitrobot.ai`.
 - Earth Rover Challenge — `earth-rover-challenge.github.io` (IROS 2026).
 - Waveshare ESP32 firmware — `waveshareteam/ugv_base_general` (see `WAVESHARE_PROTOCOL.md`).
+- Mahony PI complementary attitude filter — `ahrs.readthedocs.io/en/latest/filters/mahony.html` (heading + gyro-bias, §7.1).
+- `robot_localization` dual-EKF + navsat_transform — ROS GPS/IMU/odometry fusion (§7.1 Kalman pose).
+- [RPP] Macenski et al., *Regulated Pure Pursuit for Robot Path Tracking*, arXiv:2305.20026; Nav2 `regulated_pure_pursuit` (§7.2).
