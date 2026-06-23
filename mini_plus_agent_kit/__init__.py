@@ -18,9 +18,9 @@ from .rover import (
     RoverVerbs, EarthRoverVerbs, HarnessVerbs, make_verbs, Scene,
 )
 from .work import (
-    WorkSink, BitRobotSink, OnchainRoverSink, RaceProofSink, MultiSink,
+    WorkSink, BitRobotSink, OnchainRoverSink, SolanaRoverSink, RaceProofSink, MultiSink,
     Artifact, WorkRecord, submit_work, store_artifact, walrus_put,
-    ipfs_cid, cid_v1_raw,
+    ipfs_cid, cid_v1_raw, solana_explorer_tx,
 )
 from .agent import MiniPlusAgent, RunResult, load_system_prompt, DEFAULT_MODEL
 from .tools import TOOLS, make_tools, dispatch
@@ -35,9 +35,9 @@ __all__ = [
     # verbs
     "RoverVerbs", "EarthRoverVerbs", "HarnessVerbs", "make_verbs", "Scene",
     # work / onchain
-    "WorkSink", "BitRobotSink", "OnchainRoverSink", "RaceProofSink", "MultiSink",
+    "WorkSink", "BitRobotSink", "OnchainRoverSink", "SolanaRoverSink", "RaceProofSink", "MultiSink",
     "Artifact", "WorkRecord", "submit_work", "store_artifact", "walrus_put",
-    "ipfs_cid", "cid_v1_raw",
+    "ipfs_cid", "cid_v1_raw", "solana_explorer_tx",
     # agent
     "MiniPlusAgent", "RunResult", "load_system_prompt", "DEFAULT_MODEL",
     # chat surface

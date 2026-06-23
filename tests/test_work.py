@@ -87,6 +87,53 @@ def test_race_proof_sink_settles_market():
     assert "raceId" not in next(j for u, j in posts2 if u.endswith("/race/settle"))
 
 
+def test_solana_rover_anchors_on_clanker5000():
+    _patch_walrus()
+    posts = _record_module_post()
+    sink = M.SolanaRoverSink(sidecar_url="http://x", robot="guard", skill="deliver", cluster="devnet")
+    rec = M.submit_work(sink, b"frame", label="delivery", vrw_points=140)
+    proof = next(j for u, j in posts if u.endswith("/proof"))
+    gf = next(j for u, j in posts if u.endswith("/give-feedback"))
+    assert proof["blobId"] == "BLOBZ" and proof["sha256"].startswith("0x")
+    assert gf["robot"] == "guard" and gf["skill"] == "deliver" and gf["score"] == 100
+    assert not gf["sha256"].startswith("0x") and gf["sha256"] == rec.artifact.sha256[2:]
+    v = rec.results["validate"]
+    assert v["tx"] == "0xfb" and v["verified"] is True            # score 100 ≥ 70 threshold
+    assert v["explorer"] == "https://explorer.solana.com/tx/0xfb?cluster=devnet"
+    assert not sink._pending
+
+
+def test_solana_rover_verified_threshold_and_anchor_disabled():
+    _patch_walrus()
+    posts = _record_module_post()
+    # score 50 < 70 → not verified
+    r = M.submit_work(M.SolanaRoverSink(sidecar_url="http://x", score=50), b"x", label="t", vrw_points=0)
+    assert r.results["validate"]["verified"] is False
+    # anchor disabled → no give-feedback call
+    posts2 = _record_module_post()
+    r2 = M.submit_work(M.SolanaRoverSink(sidecar_url="http://x", anchor=False), b"x", label="t", vrw_points=9)
+    assert any(u.endswith("/proof") for u, _ in posts2)
+    assert not any(u.endswith("/give-feedback") for u, _ in posts2)
+    assert r2.results["validate"] == {"ok": True, "note": "anchor disabled"}
+
+
+def test_multisink_bitrobot_plus_solana_one_run():
+    # one artifact fanned to both ledgers (BitRobot subnet + Solana clanker5000)
+    _patch_walrus()
+    posts = _record_module_post()
+    sol = M.SolanaRoverSink(sidecar_url="http://x", robot="guard")
+
+    class FakeBR(W.WorkSink):
+        def register_resource(s, *a, **k): return {}
+        def task_start(s, e, **k): return {"task_run_id": "RUN1"}
+        def task_end(s, r, a, **k): return {"ok": True}
+        def task_validate(s, r, p): return {"vrw": p}
+
+    rec = M.submit_work(W.MultiSink(FakeBR(), sol), b"frame", label="x", vrw_points=80)
+    assert any(u.endswith("/give-feedback") for u, _ in posts)     # Solana leg fired
+    assert isinstance(rec.results["validate"], list) and len(rec.results["validate"]) == 2
+
+
 def test_bitrobot_register_and_attribution():
     _patch_walrus()
     events = []

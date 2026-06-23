@@ -8,11 +8,17 @@ one or more sinks:
   ``POST /subnets/{id}/events`` with ``register_resource`` → ``task_start`` →
   ``task_end {raw_data_uri, raw_data_cid}`` → ``task_validate {vrw_points}`` →
   Subnet Points → Bolts; the resource is an Entity NFT on Solana.
-* :class:`OnchainRoverSink` — your existing stack: register the ``(sha256,
-  blobId)`` proof with the sidecar (``POST /proof``), which your ``settle.ts``
-  anchors on Arc/Solana via ``giveFeedback`` / ``settleRaceOnChain``.
+* :class:`OnchainRoverSink` — the Arc/EVM stack (Clanker 500): register the
+  ``(sha256, blobId)`` proof with the sidecar (``POST /proof``), which ``settle.ts``
+  anchors on Arc via ``ReputationRegistry.giveFeedback``.
+* :class:`SolanaRoverSink` — the Solana stack (Clanker 5000): the same ``/proof`` +
+  ``/give-feedback`` HTTP surface, but the native-Solana sidecar anchors it on the
+  ``clanker5000`` Anchor program (``give_feedback``: a per-agent reputation PDA with
+  ``feedback_uri = walrus://blobId`` and ``feedback_hash = sha256``). Returns a
+  Solana signature + explorer link.
 
-One artifact, both ledgers. Combine sinks with :class:`MultiSink`.
+One artifact, every ledger. Combine sinks with :class:`MultiSink` (e.g. BitRobot +
+Solana from one robot run).
 """
 
 from __future__ import annotations
@@ -354,6 +360,104 @@ class RaceProofSink(WorkSink):
             r = httpx.post(f"{self.sidecar_url}/race/settle", json=body, timeout=self.timeout)
             r.raise_for_status()
             return r.json()  # { tx, status, explorer, ... }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+def solana_explorer_tx(signature: str, cluster: str = "devnet") -> str:
+    """Solana Explorer URL for a transaction signature (mainnet drops the cluster)."""
+    url = f"https://explorer.solana.com/tx/{signature}"
+    return url if cluster == "mainnet-beta" else f"{url}?cluster={cluster}"
+
+
+class SolanaRoverSink(WorkSink):
+    """Anchor robot work on the ``clanker5000`` Solana program (the Clanker 5000 stack).
+
+    The Solana counterpart of :class:`OnchainRoverSink` (Arc/EVM). The
+    onchain-rover-solana sidecar (port 4021) is *native-Solana* — its chain backend
+    drives the ``clanker5000`` Anchor program — and serves the same HTTP surface:
+
+    * ``task_end``  → ``POST /proof {blobId, sha256, label}`` (the tracker the UI reads).
+    * ``task_validate`` → ``POST /give-feedback {robot, skill, score, blobId, sha256}``,
+      which calls ``settle.giveFeedback`` → ``clanker5000.give_feedback``: a per-agent
+      reputation PDA storing ``feedback_uri = walrus://{blobId}`` and ``feedback_hash =
+      sha256`` (32 bytes). Score is 0–100; ``≥ 70`` clears the program's attestation
+      threshold (``ATTESTATION_THRESHOLD``). Returns the Solana transaction signature,
+      surfaced here with an explorer link and a ``verified`` flag.
+
+    The robot's on-chain agent PDA is resolved sidecar-side from ``robot`` — register
+    it once via the sidecar's ``/register-agent`` (→ ``clanker5000.register_agent``).
+    ``sha256`` may be sent 0x-prefixed or bare (the Solana client strips ``0x``).
+    Set ``anchor=False`` to register the proof without the chain write.
+    """
+
+    def __init__(
+        self,
+        sidecar_url: str | None = None,
+        *,
+        robot: str = "guard",
+        skill: str = "deliver",
+        score: int | None = None,
+        anchor: bool = True,
+        cluster: str = "devnet",
+        timeout: float = 30.0,
+    ):
+        self.sidecar_url = (
+            sidecar_url or os.environ.get("SOLANA_SIDECAR_URL")
+            or os.environ.get("SIDECAR_URL", "http://localhost:4021")
+        ).rstrip("/")
+        self.robot = robot
+        self.skill = skill
+        self.score = score
+        self.anchor = anchor
+        self.cluster = cluster
+        self.timeout = timeout
+        self._pending: dict[str, tuple[Artifact, str]] = {}
+
+    def register_resource(self, name, subtype, owner, metadata) -> dict:
+        return {"ok": True,
+                "note": "register via the sidecar /register-agent → clanker5000.register_agent"}
+
+    def task_start(self, event_id: str, **kw) -> dict:
+        return {"ok": True, "task_run_id": event_id}
+
+    def task_end(self, run_ref: str, artifact: Artifact, *, label: str = "agent work", **kw) -> dict:
+        self._pending[run_ref] = (artifact, label)
+        try:
+            r = httpx.post(
+                f"{self.sidecar_url}/proof",
+                json={"blobId": artifact.walrus_blob_id, "sha256": artifact.sha256, "label": label},
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def task_validate(self, run_ref: str, vrw_points: int) -> dict:
+        artifact, label = self._pending.pop(run_ref, (None, "agent work"))
+        if not self.anchor:
+            return {"ok": True, "note": "anchor disabled"}
+        if artifact is None:
+            return {"ok": False, "error": "no artifact recorded for this run"}
+        # clanker5000 stores a 0-100 reputation value; map VRW points unless overridden.
+        score = self.score if self.score is not None else max(0, min(100, int(vrw_points)))
+        # the Solana client strips a leading 0x; send bare hex for consistency.
+        sha = artifact.sha256[2:] if artifact.sha256.startswith("0x") else artifact.sha256
+        try:
+            r = httpx.post(
+                f"{self.sidecar_url}/give-feedback",
+                json={"robot": self.robot, "skill": self.skill, "score": score,
+                      "blobId": artifact.walrus_blob_id, "sha256": sha},
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            out = r.json()
+            sig = out.get("tx") or out.get("signature")
+            if sig and "explorer" not in out:
+                out["explorer"] = solana_explorer_tx(sig, self.cluster)
+            out.setdefault("verified", score >= 70)   # clanker5000 ATTESTATION_THRESHOLD
+            return out
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

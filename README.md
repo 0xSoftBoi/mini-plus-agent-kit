@@ -10,7 +10,7 @@ It's built on the three real specs in the BitRobot ecosystem, not bespoke glue:
 |---|---|---|
 | **Robot** | [LeRobot](https://huggingface.co/docs/lerobot/en/earthrover_mini_plus) robot interface (`action {linear_velocity, angular_velocity}`, observation features) | `WaveshareUGV` (LeRobot backend) ↔ upstream `EarthRoverMiniPlus` |
 | **Agent** | [openClaw branch](https://github.com/frodobots-org/earth-rovers-sdk/tree/feature/openClaw) — instruction files + safe high-level **verbs** | `RoverVerbs` + `MiniPlusAgent` (Claude, Opus 4.8) |
-| **Work** | [BitRobot subnet API](https://docs.bitrobot.ai) — Verifiable Robotic Work (`task_start/end/validate`) | `WorkSink`: `BitRobotSink` + your `OnchainRoverSink` + `RaceProofSink`, fan-out via `MultiSink` |
+| **Work** | [BitRobot subnet API](https://docs.bitrobot.ai) — Verifiable Robotic Work (`task_start/end/validate`) | `WorkSink`: `BitRobotSink` + `OnchainRoverSink` (Arc) + `SolanaRoverSink` (clanker5000) + `RaceProofSink`, fan-out via `MultiSink` |
 
 ## Architecture
 
@@ -64,10 +64,12 @@ flowchart TB
   subgraph WK["Work layer"]
     WS["WorkSink"]
     BR["BitRobotSink"]
-    OR["OnchainRoverSink"]
+    OR["OnchainRoverSink (Arc)"]
+    SR["SolanaRoverSink (clanker5000)"]
     RP["RaceProofSink"]
     WS --- BR
     WS --- OR
+    WS --- SR
     WS --- RP
   end
   AG --> MT
@@ -108,9 +110,11 @@ flowchart TB
   ART --> MS["MultiSink (one artifact, many ledgers)"]
   MS --> BR["BitRobotSink"]
   MS --> OR["OnchainRoverSink"]
+  MS --> SR["SolanaRoverSink"]
   MS --> RP["RaceProofSink"]
   BR --> E1["POST /subnets/{id}/events<br/>VRW points &rarr; Bolts"]
-  OR --> E2["POST /proof + /give-feedback<br/>settle.giveFeedback &rarr; Arc"]
+  OR --> E2["POST /proof + /give-feedback<br/>ReputationRegistry &rarr; Arc (Clanker 500)"]
+  SR --> E4["POST /proof + /give-feedback<br/>clanker5000.give_feedback &rarr; Solana (Clanker 5000)"]
   RP --> E3["POST /race/settle<br/>settle.settleRaceOnChain &rarr; Arc"]
 ```
 
@@ -229,7 +233,8 @@ print(rec.artifact.ipfs_cid, rec.artifact.walrus_url)
 ```
 
 - **`BitRobotSink`** → `register_resource` → `task_start` → `task_end {raw_data_uri, raw_data_cid}` → `task_validate {vrw_points}` (Subnet Points → Bolts; Entity NFT on Solana). `raw_data_uri` is the Walrus URL; `raw_data_cid` is computed (`cid_v1_raw` for ≤1 MiB, the `ipfs` CLI for larger).
-- **`OnchainRoverSink`** → `task_end` posts `/proof {blobId, sha256, label}` (the tracker); `task_validate` posts `/give-feedback {robot, skill, score, blobId, sha256}`, which your sidecar (`index.ts:597`) anchors on Arc via `settle.giveFeedback` → `ReputationRegistry.giveFeedback`. The robot's on-chain `agentId` is resolved sidecar-side; key custody stays in the sidecar. `OnchainRoverSink(robot="guard", skill="deliver", score=None, anchor=True)` — VRW points map to the 0–100 reputation score unless you pass an explicit `score`; set `anchor=False` to register the proof without the chain write. (The kit sends the bare hex sha256 since `giveFeedback` re-adds `0x`.)
+- **`OnchainRoverSink`** (Arc / EVM — Clanker 500) → `task_end` posts `/proof {blobId, sha256, label}` (the tracker); `task_validate` posts `/give-feedback {robot, skill, score, blobId, sha256}`, which your sidecar anchors on Arc via `settle.giveFeedback` → `ReputationRegistry.giveFeedback`. The robot's on-chain `agentId` is resolved sidecar-side; key custody stays in the sidecar. `OnchainRoverSink(robot="guard", skill="deliver", score=None, anchor=True)` — VRW points map to the 0–100 reputation score unless you pass an explicit `score`; set `anchor=False` to register the proof without the chain write. (The kit sends the bare hex sha256 since `giveFeedback` re-adds `0x`.)
+- **`SolanaRoverSink`** (Solana — Clanker 5000) → the *same* `/proof` + `/give-feedback` surface, but the native-Solana sidecar (port 4021) anchors it on the **`clanker5000`** Anchor program: `give_feedback` writes a per-agent reputation PDA carrying `feedback_uri = walrus://blobId` and `feedback_hash = sha256` (32 bytes). A score `≥ 70` clears the program's `ATTESTATION_THRESHOLD`; the call returns a **Solana signature** surfaced with an `explorer.solana.com` link and a `verified` flag. `SolanaRoverSink(robot="guard", skill="deliver", cluster="devnet")`. Register the agent once via the sidecar's `/register-agent` → `clanker5000.register_agent`. One robot run can anchor on **both ledgers at once** via `MultiSink(BitRobotSink(...), SolanaRoverSink(...))`.
 - **`RaceProofSink(winner_idx=..., race_id=None)`** → `task_validate` posts `/race/settle {raceId, winnerIdx, sha256, blobId}` → `settle.settleRaceOnChain` → `RaceMarket.settle` (judge = guard). Use when the agent is the race oracle and *its* captured finish frame should settle the parimutuel market (unlike `/race/finish`, which re-captures the guard's own photo). Needs the small `POST /race/settle` route added to the sidecar (mirrors `/give-feedback`). `race_id=None` lets the sidecar use its current `onChainRaceId`.
 
 ### Register a robot as an Entity NFT (earn VRW under its own resource)
@@ -349,7 +354,7 @@ controllers, safety, costmap + A* planner, closed-loop sim scenarios), all three
 work sinks, and a full scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 63 passed
+python3 tests/run_all.py     # zero-dependency runner  → 66 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -370,6 +375,7 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • dwa: dynamic-window local planner steers around a moving pedestrian (holds clearance, arrives)
 #  • montecarlo: real NavController over 150 domain-randomized worlds → 99.3% true-arrival
 #  • ellipsoid: full hard+soft-iron mag calibration recovers heading on a rotated ellipsoid
+#  • solana: real httpx → emulated clanker5000 sidecar (give_feedback signature + explorer)
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
 

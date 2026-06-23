@@ -88,10 +88,12 @@ flowchart TB
   subgraph WK["Work layer"]
     WS["WorkSink"]
     BR["BitRobotSink"]
-    OR["OnchainRoverSink"]
+    OR["OnchainRoverSink (Arc)"]
+    SR["SolanaRoverSink (clanker5000)"]
     RP["RaceProofSink"]
     WS --- BR
     WS --- OR
+    WS --- SR
     WS --- RP
   end
   AG --> MT
@@ -541,12 +543,14 @@ flowchart TB
   ART --> MS["MultiSink (one artifact, many ledgers)"]
   MS --> BR["BitRobotSink"]
   MS --> OR["OnchainRoverSink"]
+  MS --> SR["SolanaRoverSink"]
   MS --> RP["RaceProofSink"]
   BR --> E1["POST /subnets/{id}/events<br/>VRW points &rarr; Bolts"]
-  OR --> E2["POST /proof + /give-feedback<br/>settle.giveFeedback &rarr; Arc"]
+  OR --> E2["POST /proof + /give-feedback<br/>ReputationRegistry.giveFeedback &rarr; Arc (Clanker 500)"]
+  SR --> E4["POST /proof + /give-feedback<br/>clanker5000.give_feedback &rarr; Solana (Clanker 5000)"]
   RP --> E3["POST /race/settle<br/>settle.settleRaceOnChain &rarr; Arc"]
 ```
-*Figure 8 — One content-addressed artifact, multiple ledgers.*
+*Figure 8 — One content-addressed artifact, multiple ledgers (Arc + Solana).*
 
 The canonical BitRobot path is a four-event lifecycle culminating in network-wide
 Bolts:
@@ -566,12 +570,19 @@ stateDiagram-v2
 | Sink | Endpoint(s) | Anchor |
 |---|---|---|
 | `BitRobotSink` | `POST /subnets/{id}/events` | Subnet Points → Bolts; resource = Entity NFT (Solana) |
-| `OnchainRoverSink` | `POST /proof`, `POST /give-feedback` | `settle.giveFeedback` → `ReputationRegistry` (Arc) |
+| `OnchainRoverSink` | `POST /proof`, `POST /give-feedback` | `ReputationRegistry.giveFeedback` → **Arc / EVM** (Clanker 500) |
+| `SolanaRoverSink` | `POST /proof`, `POST /give-feedback` | `clanker5000.give_feedback` → **Solana** (Clanker 5000) |
 | `RaceProofSink` | `POST /race/settle` | `settle.settleRaceOnChain` → `RaceMarket` (Arc) |
 
-`raw_data_uri` is the public Walrus URL; `raw_data_cid` is computed in-process
-(`cid_v1_raw` for ≤ 1 MiB, the `ipfs` CLI for larger). sha256 is sent as bare hex
-to `giveFeedback`/`settleRaceOnChain` (they re-add the `0x`).
+The Arc and Solana sinks share an identical HTTP surface — only the sidecar's chain
+backend differs — so the *same* robot run anchors on either ledger (or both, via
+`MultiSink`). On Solana the sidecar drives the `clanker5000` Anchor program:
+`give_feedback` writes a per-agent reputation PDA carrying `feedback_uri =
+walrus://blobId` and `feedback_hash = sha256` (32 bytes); a score `≥ 70` clears the
+program's `ATTESTATION_THRESHOLD`, and the call returns a Solana signature
+(surfaced with an `explorer.solana.com` link). `raw_data_uri` is the public Walrus
+URL; `raw_data_cid` is computed in-process (`cid_v1_raw` for ≤ 1 MiB, the `ipfs` CLI
+for larger). sha256 is sent as bare hex — both backends strip/re-add the `0x`.
 
 ---
 
@@ -671,10 +682,10 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 63 tests (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work · tools · agent-loop · mcp · telegram<br/>actuators · navstack · planner · estimator refinements · sim scenarios"]
+  subgraph H["Hermetic suite &mdash; 66 tests (stubbed httpx / anthropic)"]
+    HU["units · geo · registry · verbs · work (BitRobot/Arc/Solana) · tools · agent-loop · mcp<br/>telegram · actuators · navstack · planner · estimator refinements · sim scenarios"]
   end
-  subgraph L["Live suite &mdash; 11 tests (real I/O, no stubs)"]
+  subgraph L["Live suite &mdash; 12 tests (real I/O, no stubs)"]
     L1["harness · mcp · track_color · navigate"]
     L5["navstack: fused vs bang-bang, noisy sim"]
     L6["heading: GPS-course rescues biased mag"]
@@ -682,7 +693,8 @@ flowchart TB
     L8["dwa: local avoidance of a moving obstacle"]
     L9["montecarlo: 150 domain-randomized worlds"]
     L10["ellipsoid: full hard+soft-iron mag cal"]
-    L11["walrus: real testnet store + retrieve"]
+    L11["solana: real httpx → clanker5000 sidecar"]
+    L12["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
