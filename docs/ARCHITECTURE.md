@@ -378,6 +378,45 @@ platform's obstacle sense (camera-derived occupancy, a site map); the Earth Rove
 SDK exposes only 1-D front lidar, so there the reactive `SafetyEnvelope` remains the
 last line of defence and this is the framework for richer obstacle data.
 
+### 7.3 Local obstacle avoidance: the Dynamic Window Approach
+
+§7.2 routes around obstacles *known to the costmap*, and the `SafetyEnvelope` can
+only **brake** on a surprise. Neither *steers around* an obstacle that appears at run
+time — a pedestrian, a cone, a parked scooter. The **Dynamic Window Approach** (Fox,
+Burgard & Thrun, 1997) is the standard local planner for exactly this; it searches
+the space of immediately-executable velocities. Each cycle (`control.DWAPlanner`):
+
+1. **Dynamic window** — restrict to $(v,\omega)$ reachable from the current command
+   within one control period given acceleration limits.
+2. **Rollout** — forward-simulate each candidate over a short horizon at constant
+   $(v,\omega)$.
+3. **Admissibility** — discard any trajectory whose clearance falls below the robot
+   radius (a collision).
+4. **Objective** — score the survivors by a normalized weighted sum and commit the
+   best; the `SafetyEnvelope` still gates it:
+$$G(v,\omega)=w_g\cdot\text{goal}+w_c\cdot\text{clearance}+w_s\cdot\text{speed}$$
+
+```mermaid
+flowchart LR
+  CUR["current (v, w)"] --> WIN["dynamic window<br/>reachable (v, w) by accel"]
+  WIN --> ROLL["roll out each candidate<br/>over horizon"]
+  OBS["sensed obstacles<br/>points / lidar"] --> ROLL
+  ROLL --> REJ["discard colliding<br/>trajectories"]
+  REJ --> SCORE["score: goal + clearance + speed<br/>normalized, weighted"]
+  SCORE --> BEST["best (v, w)"]
+  BEST --> SAFE["SafetyEnvelope"]
+  SAFE --> ROB["/control"]
+```
+*Figure 6d — the dynamic-window local planner.*
+
+**Why it matters (validated).** In `tests/live/test_live_dwa.py` a pedestrian walks
+across the corridor to intercept the rover on the checkpoint approach. Plain pursuit
+(no avoidance) closes to **0.16 m — a collision**; the DWA planner holds **2.87 m
+clearance** and still reaches the goal. Wired into `NavController(use_dwa=True)` with
+an `obstacles` list, it is the reactive avoidance layer beneath the global plan —
+together giving the Nav2 trio: global A\* path, regulated-pursuit tracking, and
+dynamic-window local avoidance.
+
 ---
 
 ## 8. Visual servoing: `track_color`
@@ -546,17 +585,18 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 54 tests (stubbed httpx / anthropic)"]
+  subgraph H["Hermetic suite &mdash; 56 tests (stubbed httpx / anthropic)"]
     HU["units · geo · registry · verbs · work · tools<br/>agent-loop · mcp · telegram · actuators · navstack · planner"]
   end
-  subgraph L["Live suite &mdash; 7 tests (real I/O, no stubs)"]
+  subgraph L["Live suite &mdash; 8 tests (real I/O, no stubs)"]
     L1["harness: real httpx &harr; HTTP emulator"]
     L2["mcp: real protocol &harr; dispatch"]
     L3["track_color: real HSV on generated JPEG"]
     L4["navigate: real geo &harr; kinematic sim"]
     L5["navstack: fused vs bang-bang, noisy sim"]
     L6["planner: A* + reg. pursuit around obstacle"]
-    L7["walrus: real testnet store + retrieve"]
+    L7["dwa: local avoidance of a moving obstacle"]
+    L8["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
@@ -569,6 +609,7 @@ flowchart TB
 | navigate | real geo + the `goto_checkpoint` controller converging to a checkpoint (65 m → 9 m) in a 2-D kinematic sim |
 | navstack | fused `NavController` (Kalman pose filter + Mahalanobis gating) vs bang-bang baseline on the same noisy truth incl. GPS multipath: baseline false-arrives 34.6 m out; fused gates every outlier, arrives truly (14.9 m), heading 2.2× better than raw mag |
 | planner | A\* over an inflated costmap + regulated pure pursuit vs straight-line seeking: naive drives through a building (46 ticks inside); planned route (69 m vs 60 m straight) reaches the goal with 0 incursions |
+| dwa | Dynamic Window Approach vs plain pursuit with a *moving* pedestrian: pursuit closes to 0.16 m (collision); DWA holds 2.87 m clearance and still reaches the goal |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
 
 > **Scope of validation.** The plumbing, protocols, content-addressing, geometry,
@@ -599,3 +640,4 @@ mission; the kit provides the policy.
 - Mahony PI complementary attitude filter — `ahrs.readthedocs.io/en/latest/filters/mahony.html` (heading + gyro-bias, §7.1).
 - `robot_localization` dual-EKF + navsat_transform — ROS GPS/IMU/odometry fusion (§7.1 Kalman pose).
 - [RPP] Macenski et al., *Regulated Pure Pursuit for Robot Path Tracking*, arXiv:2305.20026; Nav2 `regulated_pure_pursuit` (§7.2).
+- [DWA] Fox, Burgard & Thrun, *The Dynamic Window Approach to Collision Avoidance*, IEEE R&A 1997 (§7.3).

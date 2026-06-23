@@ -7,7 +7,7 @@ import math
 from mini_plus_agent_kit.estimator import HeadingFilter, PoseFilter, mag_heading_deg
 from mini_plus_agent_kit.control import (
     HeadingPID, PursuitController, DistanceController, SafetyEnvelope, SafetyLimits,
-    NavController,
+    NavController, DWAPlanner,
 )
 from mini_plus_agent_kit.geo import heading_error_deg
 
@@ -106,6 +106,38 @@ def test_navcontroller_converges_and_gates():
     # safety gate: low battery zeroes the twist
     g = nav.step(0.2, heading_deg=0.0, goal_lat=glat, goal_lon=glon, battery=5.0)
     assert g.linear == 0.0 and g.angular == 0.0 and not g.safe
+
+
+def test_dwa_seeks_goal_when_clear_and_avoids_when_blocked():
+    dwa = DWAPlanner(v_scale_mps=1.2, robot_radius=1.0, tol_m=2.0)
+    # clear path to a goal due north → drive ahead, ~no turn
+    clear = dwa.step(0.0, 0.0, 0.0, 0.0, 20.0, v_cmd0=0.5, obstacles=None)
+    assert clear.linear > 0 and abs(clear.angular) < 0.2 and not clear.arrived
+    # obstacle squarely ahead on the straight line → must steer off-axis to avoid it
+    blocked = dwa.step(0.0, 0.0, 0.0, 0.0, 20.0, v_cmd0=0.5, obstacles=[(0.0, 3.0)])
+    assert abs(blocked.angular) > abs(clear.angular)
+
+
+def test_dwa_rounds_a_static_obstacle_closed_loop():
+    dwa = DWAPlanner(v_scale_mps=2.0, robot_radius=1.2, tol_m=2.0)
+    goal = (0.0, 24.0)
+    x = y = th = 0.0
+    v0 = w0 = 0.0
+    obstacle = (0.0, 12.0)                       # blocking the straight line
+    min_clear = float("inf")
+    arrived = False
+    for _ in range(600):
+        min_clear = min(min_clear, math.hypot(x - obstacle[0], y - obstacle[1]))
+        c = dwa.step(x, y, th, goal[0], goal[1], v_cmd0=v0, w_cmd0=w0, obstacles=[obstacle])
+        if c.arrived:
+            arrived = True
+            break
+        v0, w0 = c.linear, c.angular
+        th = (th - c.angular * 60.0 * 0.2) % 360.0
+        ds = 2.0 * c.linear * 0.2
+        x += ds * math.sin(math.radians(th))
+        y += ds * math.cos(math.radians(th))
+    assert arrived and min_clear >= 1.2          # reached goal without breaching clearance
 
 
 def test_mag_heading():

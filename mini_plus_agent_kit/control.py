@@ -184,6 +184,103 @@ class RegulatedPurePursuit:
 
 
 # --------------------------------------------------------------------------- #
+# Dynamic Window Approach (local obstacle avoidance)
+# --------------------------------------------------------------------------- #
+def _linspace(lo: float, hi: float, n: int) -> list:
+    if n <= 1 or hi <= lo:
+        return [lo]
+    return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+
+
+class DWAPlanner:
+    """Dynamic Window Approach — steer *around* obstacles, not just brake.
+
+    The reactive `SafetyEnvelope` can only stop; a path planner (`planner.py`) only
+    knows the obstacles on its costmap. The DWA local planner closes the gap for
+    *newly-sensed or moving* obstacles: it samples the reachable ``(v, ω)`` velocity
+    window (bounded by acceleration limits about the current command), rolls each
+    candidate forward over a short horizon, **discards trajectories that collide**,
+    and scores the survivors by a weighted sum of **goal progress**, **obstacle
+    clearance**, and **speed** — then commits the best command (Fox, Burgard &
+    Thrun, 1997). The result actively rounds a pedestrian/cone while still driving to
+    the goal. Velocities/yaw are the kit's normalized commands; rollouts are physical
+    via ``v_scale_mps`` (m/s at v=1) and ``yaw_rate_dps`` (deg/s at ω=1).
+    """
+
+    def __init__(self, v_scale_mps: float = 1.2, yaw_rate_dps: float = 60.0,
+                 robot_radius: float = 0.6, horizon_s: float = 2.0, sim_dt: float = 0.2,
+                 v_samples: int = 7, w_samples: int = 19, accel_v: float = 3.0,
+                 accel_w: float = 6.0, tol_m: float = 2.0, clear_cap_m: float = 3.0,
+                 w_goal: float = 0.6, w_clear: float = 0.3, w_speed: float = 0.1):
+        self.v_scale_mps, self.yaw_rate_dps = v_scale_mps, yaw_rate_dps
+        self.robot_radius = robot_radius
+        self.horizon_s, self.sim_dt = horizon_s, sim_dt
+        self.v_samples, self.w_samples = v_samples, w_samples
+        self.accel_v, self.accel_w = accel_v, accel_w
+        self.tol_m, self.clear_cap_m = tol_m, clear_cap_m
+        self.w_goal, self.w_clear, self.w_speed = w_goal, w_clear, w_speed
+
+    def _clearance(self, x, y, obstacles):
+        if not obstacles:
+            return self.clear_cap_m
+        d = min(math.hypot(x - ox, y - oy) for ox, oy in obstacles)
+        return min(d, self.clear_cap_m)
+
+    def _rollout(self, x, y, th, v_cmd, w_cmd, obstacles):
+        """Constant-(v,ω) rollout; returns (endpoint, min_clearance, collided)."""
+        v_mps = v_cmd * self.v_scale_mps
+        steps = max(1, int(self.horizon_s / self.sim_dt))
+        min_clear = self.clear_cap_m
+        for _ in range(steps):
+            th = (th - w_cmd * self.yaw_rate_dps * self.sim_dt) % 360.0
+            r = math.radians(th)
+            x += v_mps * self.sim_dt * math.sin(r)
+            y += v_mps * self.sim_dt * math.cos(r)
+            c = self._clearance(x, y, obstacles)
+            if c <= self.robot_radius:
+                return (x, y, th), c, True
+            min_clear = min(min_clear, c)
+        return (x, y, th), min_clear, False
+
+    def step(self, x: float, y: float, heading_deg: float, gx: float, gy: float, *,
+             v_cmd0: float = 0.0, w_cmd0: float = 0.0, obstacles: list | None = None) -> Cmd:
+        dist = math.hypot(gx - x, gy - y)
+        bearing = math.degrees(math.atan2(gx - x, gy - y)) % 360.0
+        err = heading_error_deg(heading_deg, bearing)
+        if dist <= self.tol_m:
+            return Cmd(0.0, 0.0, dist, bearing, err, True)
+        # dynamic window: velocities reachable from the current command this period
+        v_lo = max(0.0, v_cmd0 - self.accel_v * self.sim_dt)
+        v_hi = min(1.0, v_cmd0 + self.accel_v * self.sim_dt)
+        w_lo = max(-1.0, w_cmd0 - self.accel_w * self.sim_dt)
+        w_hi = min(1.0, w_cmd0 + self.accel_w * self.sim_dt)
+        cands = []
+        for v in _linspace(v_lo, v_hi, self.v_samples):
+            for w in _linspace(w_lo, w_hi, self.w_samples):
+                (ex, ey, _), clear, hit = self._rollout(x, y, heading_deg, v, w, obstacles)
+                if hit:
+                    continue
+                goal_d = math.hypot(gx - ex, gy - ey)
+                cands.append([v, w, goal_d, clear])
+        if not cands:
+            return Cmd(0.0, 0.0, dist, bearing, err, False)   # boxed in → stop (failsafe)
+        # normalize each objective across candidates, then weighted-sum (Fox et al.)
+        gd = [c[2] for c in cands]
+        cl = [c[3] for c in cands]
+        gmin, gmax = min(gd), max(gd)
+        cmin, cmax = min(cl), max(cl)
+        best, best_score = cands[0], -1e18
+        for c in cands:
+            s_goal = 1.0 - (c[2] - gmin) / (gmax - gmin) if gmax > gmin else 1.0   # closer = better
+            s_clear = (c[3] - cmin) / (cmax - cmin) if cmax > cmin else 1.0
+            s_speed = c[0]
+            score = self.w_goal * s_goal + self.w_clear * s_clear + self.w_speed * s_speed
+            if score > best_score:
+                best_score, best = score, c
+        return Cmd(best[0], best[1], dist, bearing, err, False)
+
+
+# --------------------------------------------------------------------------- #
 # Odometry distance controller
 # --------------------------------------------------------------------------- #
 class DistanceController:
@@ -283,16 +380,19 @@ class NavController:
     def __init__(self, base_lat: float, base_lon: float, *, v_max: float = 0.6,
                  k_ang: float = 1.6, slow_radius_m: float = 8.0, tol_m: float = 15.0,
                  v_scale_mps: float = 0.6, limits: SafetyLimits | None = None,
-                 use_rpp: bool = False):
+                 use_rpp: bool = False, use_dwa: bool = False, yaw_rate_dps: float = 60.0):
         self.hf = HeadingFilter()
         self.pf = PoseFilter(base_lat, base_lon)
         self.pp = PursuitController(v_max=v_max, k_ang=k_ang,
                                     slow_radius_m=slow_radius_m, tol_m=tol_m)
         self.rpp = RegulatedPurePursuit(v_max=v_max, tol_m=tol_m) if use_rpp else None
+        self.dwa = (DWAPlanner(v_scale_mps=v_scale_mps, yaw_rate_dps=yaw_rate_dps,
+                               tol_m=tol_m) if use_dwa else None)
         self.path: list | None = None       # ENU world points from the global planner
         self.safety = SafetyEnvelope(limits)
         self.v_scale_mps = v_scale_mps
         self._last_v = 0.0
+        self._last_w = 0.0
 
     def set_path(self, path_xy: list) -> None:
         """Track this planned ENU path (from ``planner.plan_path``) with regulated pure pursuit."""
@@ -305,7 +405,7 @@ class NavController:
              yaw_rate_dps: float | None = None, ds_m: float | None = None,
              battery: float | None = None, roll: float | None = None,
              pitch: float | None = None, lidar_front_m: float | None = None,
-             estop: bool = False) -> NavStep:
+             estop: bool = False, obstacles: list | None = None) -> NavStep:
         hhat = self.hf.update(dt, gyro_z_dps=yaw_rate_dps or 0.0, absolute_deg=heading_deg)
         # dead-reckon: measured wheel odometry if given, else commanded-velocity proxy
         if ds_m is None:
@@ -315,16 +415,20 @@ class NavController:
         if lat is not None and lon is not None:
             gps_rejected = not self.pf.correct_gps(lat, lon)
         x, y = self.pf.xy()
+        gx, gy = self.pf.to_xy(goal_lat, goal_lon)
         if self.path and self.rpp is not None:               # track the planned path
             cmd = self.rpp.step(x, y, hhat, self.path)
+        elif self.dwa is not None and obstacles:             # reactive local avoidance
+            cmd = self.dwa.step(x, y, hhat, gx, gy, v_cmd0=self._last_v,
+                                w_cmd0=self._last_w, obstacles=obstacles)
         else:                                                # seek the single waypoint
-            gx, gy = self.pf.to_xy(goal_lat, goal_lon)
             cmd = self.pp.step(x, y, hhat, gx, gy)
         verdict = self.safety.check(cmd.linear, battery=battery, roll=roll, pitch=pitch,
                                     lidar_front_m=lidar_front_m, estop=estop)
         linear = cmd.linear * verdict.scale if verdict.ok else 0.0
         angular = cmd.angular if verdict.ok else 0.0
         self._last_v = linear
+        self._last_w = angular
         est_lat, est_lon = self.pf.latlon()
         return NavStep(linear, angular, cmd.distance_m, cmd.heading_error_deg,
                        cmd.arrived, verdict.ok, verdict.reason, est_lat, est_lon,

@@ -281,11 +281,19 @@ SDK), with real GPS waypoint navigation:
   into anything between it and the goal; in the sim it ploughs through a building
   for 46 ticks while the planned route reaches the checkpoint with **0 incursions**.
   See [§7.2](docs/ARCHITECTURE.md#72-global-planning-around-obstacles-a--regulated-pure-pursuit).
+- `NavController(use_dwa=True)` — a **Dynamic Window Approach** local planner
+  (`control.py`): samples the reachable `(v, ω)` window, rolls each candidate out,
+  discards colliding trajectories, and scores goal/clearance/speed to *steer around*
+  a moving obstacle (the reactive layer beneath the global plan). In the sim a
+  pedestrian crosses the corridor: plain pursuit closes to 0.16 m (collision) while
+  DWA holds 2.87 m clearance and still reaches the goal.
+  See [§7.3](docs/ARCHITECTURE.md#73-local-obstacle-avoidance-the-dynamic-window-approach).
 
 The live tests drive a 2D kinematic rover sim over real HTTP to a GPS checkpoint
 (`tests/live/test_live_navigate.py`), run the fused-vs-baseline A/B under sensor
-noise + GPS multipath (`tests/live/test_live_navstack.py`), and route around an
-obstacle with A\* + regulated pursuit (`tests/live/test_live_planner.py`).
+noise + GPS multipath (`tests/live/test_live_navstack.py`), route around an obstacle
+with A\* + regulated pursuit (`tests/live/test_live_planner.py`), and dodge a moving
+pedestrian with DWA (`tests/live/test_live_dwa.py`).
 
 ## Waveshare as a LeRobot robot
 
@@ -305,7 +313,7 @@ mini_plus_agent_kit/
   harness_client.py  HarnessClient      — Waveshare robot-harness transport
   rover.py           RoverVerbs         — openClaw verb surface (2 backends)
   estimator.py       HeadingFilter/PoseFilter — Mahony heading + Kalman GPS pose fusion
-  control.py         NavController       — pursuit + PID + regulated-pure-pursuit + safety
+  control.py         NavController       — pursuit + RPP + DWA + PID + safety stack
   planner.py         Costmap + A*        — global path planning around obstacles
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
   agent.py           MiniPlusAgent      — Claude loop + instruction-file prompt
@@ -326,7 +334,7 @@ controllers, safety, costmap + A* planner), all three work sinks, and a full
 scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 54 passed
+python3 tests/run_all.py     # zero-dependency runner  → 56 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -343,6 +351,7 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • navstack A/B: fused NavController (Kalman + Mahalanobis gating) truly arrives and rejects
 #    GPS multipath where the bang-bang baseline false-arrives 34.6 m out
 #  • planner: A* over a costmap + regulated pure pursuit routes around a building (0 incursions)
+#  • dwa: dynamic-window local planner steers around a moving pedestrian (holds clearance, arrives)
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
 
