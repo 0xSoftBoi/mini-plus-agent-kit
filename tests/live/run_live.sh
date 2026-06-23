@@ -16,5 +16,7 @@ echo "== live: navstack (fused estimator+pursuit vs bang-bang, noisy sim) =="; .
 echo "== live: heading (GPS-course fusion rescues a biased magnetometer) =="; .venv/bin/python tests/live/test_live_heading.py
 echo "== live: planner (A* + regulated pursuit routes around obstacle) =="; .venv/bin/python tests/live/test_live_planner.py
 echo "== live: dwa (dynamic-window local planner avoids moving obstacle) =="; .venv/bin/python tests/live/test_live_dwa.py
+echo "== live: montecarlo (domain-randomized validation of the real nav stack) =="; .venv/bin/python tests/live/test_live_montecarlo.py
+echo "== live: ellipsoid (full hard+soft-iron mag calibration, numpy) =="; .venv/bin/python tests/live/test_live_ellipsoid.py
 echo "== live: walrus (real testnet) ==";            .venv/bin/python tests/live/test_live_walrus.py
 echo "ALL LIVE TESTS PASSED"

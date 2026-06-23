@@ -409,7 +409,9 @@ class NavController:
              yaw_rate_dps: float | None = None, ds_m: float | None = None,
              battery: float | None = None, roll: float | None = None,
              pitch: float | None = None, lidar_front_m: float | None = None,
-             estop: bool = False, obstacles: list | None = None) -> NavStep:
+             estop: bool = False, obstacles: list | None = None,
+             gps_age_steps: int = 0, gps_course_deg: float | None = None,
+             gps_speed_mps: float | None = None) -> NavStep:
         # heading: predict on gyro, correct toward mag + (speed-gated) GPS course.
         # The course was derived last step from KF-accepted fixes only (see below).
         hhat = self.hf.update(dt, gyro_z_dps=yaw_rate_dps or 0.0, absolute_deg=heading_deg,
@@ -422,13 +424,18 @@ class NavController:
         gps_rejected = False
         self._t_acc += dt
         if lat is not None and lon is not None:
-            accepted = self.pf.correct_gps(lat, lon)
+            accepted = self.pf.correct_gps(lat, lon, age_steps=gps_age_steps)
             gps_rejected = not accepted
             if accepted:
-                # course-over-ground from consecutive *accepted* fixes (multipath is
-                # already gated out), and only when the displacement clears the GPS
-                # noise — else position-differenced course is noise, not signal.
-                if self._prev_acc is not None:
+                if gps_course_deg is not None:
+                    # GPS Doppler velocity: a low-noise course/speed straight from the
+                    # receiver (preferred over position differencing when available).
+                    self._pending_course = gps_course_deg
+                    self._pending_speed = gps_speed_mps or 0.0
+                elif self._prev_acc is not None:
+                    # else course-over-ground from consecutive *accepted* fixes
+                    # (multipath already gated out), and only when the displacement
+                    # clears the GPS noise — else differenced course is noise.
                     c, sp = gps_course_and_speed(self._prev_acc[0], self._prev_acc[1],
                                                  lat, lon, self._t_acc)
                     if c is not None and sp * self._t_acc > 6.0 * math.sqrt(self.pf.R):

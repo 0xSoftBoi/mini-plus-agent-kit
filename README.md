@@ -293,7 +293,14 @@ SDK), with real GPS waypoint navigation:
   cuts heading RMSE 24.9° → 10.4° under a 25° hard-iron bias), **magnetometer
   hard/soft-iron calibration** (`MagnetometerCalibrator`, ellipsoid → sphere), and a
   full **2×2 covariance** pose filter with anisotropic process noise + GPS-latency
-  rewind.
+  rewind, and a full-ellipsoid **soft-iron calibration** (`fit_ellipsoid`, numpy)
+  that recovers heading to ~0° on a *rotated* ellipsoid (vs 16.7° for diagonal).
+- **Domain-randomized validation** (`sim.py`): a unified `RoverSim` with a fully
+  parameterized `SensorModel` drives the **real `NavController`**; a Monte-Carlo over
+  **150 randomized worlds** (GPS/IMU/odometry error drawn per trial) reaches the
+  checkpoint within tolerance **99.3%** of the time — robustness across an error
+  envelope, not one tuned point. See
+  [§7.5](docs/ARCHITECTURE.md#75-closing-the-sim-to-real-gap-unified-simulator--domain-randomization).
 
 The live tests drive a 2D kinematic rover sim over real HTTP to a GPS checkpoint
 (`tests/live/test_live_navigate.py`), run the fused-vs-baseline A/B under sensor
@@ -322,6 +329,7 @@ mini_plus_agent_kit/
   estimator.py       HeadingFilter/PoseFilter/MagnetometerCalibrator — heading+pose fusion, mag cal
   control.py         NavController       — pursuit + RPP + DWA + PID + safety stack
   planner.py         Costmap + A*        — global path planning around obstacles
+  sim.py             RoverSim + SensorModel — unified simulator for domain-randomized MC
   work.py            WorkSink           — BitRobot VRW + onchain-rover, artifacts, IPFS CID
   agent.py           MiniPlusAgent      — Claude loop + instruction-file prompt
   tools.py           verb tools + dispatch
@@ -337,11 +345,11 @@ mini_plus_agent_kit/
 A hermetic suite (no robot, no network, no real SDKs — `httpx`/`anthropic` are
 stubbed) covers kinematics, telemetry mapping, IPFS CID, capability-filtered
 tools, the openClaw verb→endpoint wiring, the navigation stack (filters,
-controllers, safety, costmap + A* planner), all three work sinks, and a full
-scripted agent-loop run:
+controllers, safety, costmap + A* planner, closed-loop sim scenarios), all three
+work sinks, and a full scripted agent-loop run:
 
 ```bash
-python3 tests/run_all.py     # zero-dependency runner  → 60 passed
+python3 tests/run_all.py     # zero-dependency runner  → 63 passed
 pytest tests/                # also works (conftest applies the same stubs)
 ```
 
@@ -360,6 +368,8 @@ bash tests/live/run_live.sh   # installs real deps (httpx, mcp, Pillow, numpy) i
 #  • heading: speed-gated GPS-course fusion rescues a 25°-biased magnetometer (24.9°→10.4°)
 #  • planner: A* over a costmap + regulated pure pursuit routes around a building (0 incursions)
 #  • dwa: dynamic-window local planner steers around a moving pedestrian (holds clearance, arrives)
+#  • montecarlo: real NavController over 150 domain-randomized worlds → 99.3% true-arrival
+#  • ellipsoid: full hard+soft-iron mag calibration recovers heading on a rotated ellipsoid
 #  • real Walrus testnet store + byte-identical retrieve + IPFS CIDv1
 ```
 

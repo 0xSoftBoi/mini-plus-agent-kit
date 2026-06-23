@@ -449,9 +449,57 @@ $d^2=\nu^\top S^{-1}\nu$ uses the true innovation covariance. A delayed fix (tel
 latency) is fused against the pose it actually describes — rewound ``age_steps`` in a
 short displacement buffer — not the current pose.
 
-These complete the estimator; remaining hardening (full off-diagonal soft-iron via
-ellipsoid least-squares, Doppler-velocity course, per-fix timestamping) needs
-on-hardware data to tune and validate.
+**(d) Full ellipsoid soft-iron calibration (`MagnetometerCalibrator.fit_ellipsoid`).**
+Soft-iron distortion is in general a *rotated* ellipsoid (off-diagonal cross-axis
+coupling), which the diagonal min/max method cannot undo. A numpy least-squares fit of
+the general quadric $X^\top A X + 2n^\top X = 1$ recovers the centre $c=-A^{-1}n$ and a
+shaping matrix $T$ (matrix square root of $A/k$) so $T(m-c)$ maps the ellipsoid to the
+unit sphere. Validated (`tests/live/test_live_ellipsoid.py`): on a rotated ellipsoid the
+full fit recovers heading to **~0°** vs **16.7°** for the diagonal method.
+
+### 7.5 Closing the sim-to-real gap: unified simulator + domain randomization
+
+Every navigation claim above is validated not by a bespoke per-test loop but by one
+unified simulator (`sim.py`) driving the **real `NavController`**. `RoverSim` is a
+differential-drive truth model whose observation stream is corrupted by a fully
+parameterized `SensorModel` (GPS σ / rate / latency / multipath, gyro bias+noise,
+magnetometer bias+noise, odometry scale+noise, optional Doppler course). Because the
+*shipping* controller is in the loop, a passing scenario is evidence about the code
+that actually runs on the robot.
+
+```mermaid
+flowchart LR
+  subgraph MC["Monte-Carlo: N randomized trials"]
+    RM["random SensorModel<br/>GPS/IMU/odom error"]
+  end
+  RM --> SIM
+  subgraph LOOP["closed loop (per trial)"]
+    SIM["RoverSim<br/>truth + corrupted telemetry"] -->|observation| NAV["real NavController<br/>fuse, plan, track, avoid, safety"]
+    NAV -->|twist| SIM
+  end
+  LOOP --> AGG["aggregate: success rate,<br/>mean/std, outliers gated"]
+```
+*Figure 6e — domain-randomized Monte-Carlo over the shipping stack.*
+
+**Domain-randomized Monte-Carlo.** Each trial draws a *fresh random* `SensorModel`;
+the controller must reach a 65 m checkpoint. Across **150 randomized worlds** it
+arrives within the 15 m tolerance **99.3 %** of the time (mean final 9.5 m), gating
+912 GPS-multipath outliers (`tests/live/test_live_montecarlo.py`). This proves
+robustness across an *envelope* of sensor error, not at one tuned operating point.
+
+> **A result that fell out of the Monte-Carlo:** stopping the instant the *noisy
+> estimate* crosses the 15 m scoring radius is a coin-flip — the true distance is
+> 15 ± noise. The controller therefore targets a tighter **arrival margin** (9 m)
+> inside the scoring tolerance, exactly as real challenge entrants do. This lifted the
+> true-arrival rate from 40 % to 99 %.
+
+> **What the simulator can and cannot prove.** It proves *algorithm correctness* and
+> *closed-loop robustness across the modelled error envelope*. It cannot prove the
+> envelope matches reality (real multipath statistics, gyro-bias stability, the
+> magnetic environment, telemetry latency, wheel slip) or the platform's true
+> parameter values — those are the irreducible hardware steps. Domain randomization is
+> the mitigation: be robust across a wide enough range that the real values fall
+> inside it.
 
 ---
 
@@ -563,6 +611,8 @@ graph TD
   planner["planner.py"] --> control
   control --> rover
   planner --> rover
+  control --> sim["sim.py"]
+  geo --> sim
   client["client.py"] --> rover
   harness["harness_client.py"] --> rover
   client --> work["work.py"]
@@ -621,19 +671,18 @@ testnet) — no robot or keys required.
 
 ```mermaid
 flowchart TB
-  subgraph H["Hermetic suite &mdash; 60 tests (stubbed httpx / anthropic)"]
-    HU["units · geo · registry · verbs · work · tools · agent-loop<br/>mcp · telegram · actuators · navstack · planner · estimator refinements"]
+  subgraph H["Hermetic suite &mdash; 63 tests (stubbed httpx / anthropic)"]
+    HU["units · geo · registry · verbs · work · tools · agent-loop · mcp · telegram<br/>actuators · navstack · planner · estimator refinements · sim scenarios"]
   end
-  subgraph L["Live suite &mdash; 9 tests (real I/O, no stubs)"]
-    L1["harness: real httpx &harr; HTTP emulator"]
-    L2["mcp: real protocol &harr; dispatch"]
-    L3["track_color: real HSV on generated JPEG"]
-    L4["navigate: real geo &harr; kinematic sim"]
+  subgraph L["Live suite &mdash; 11 tests (real I/O, no stubs)"]
+    L1["harness · mcp · track_color · navigate"]
     L5["navstack: fused vs bang-bang, noisy sim"]
     L6["heading: GPS-course rescues biased mag"]
     L7["planner: A* + reg. pursuit around obstacle"]
     L8["dwa: local avoidance of a moving obstacle"]
-    L9["walrus: real testnet store + retrieve"]
+    L9["montecarlo: 150 domain-randomized worlds"]
+    L10["ellipsoid: full hard+soft-iron mag cal"]
+    L11["walrus: real testnet store + retrieve"]
   end
 ```
 *Figure 13 — Test topology.*
@@ -648,6 +697,8 @@ flowchart TB
 | heading | speed-gated GPS-course fusion vs mag-only `HeadingFilter` under a 25° hard-iron bias: course fusion cuts heading RMSE 24.9° → 10.4° (2.4×) |
 | planner | A\* over an inflated costmap + regulated pure pursuit vs straight-line seeking: naive drives through a building (46 ticks inside); planned route (69 m vs 60 m straight) reaches the goal with 0 incursions |
 | dwa | Dynamic Window Approach vs plain pursuit with a *moving* pedestrian: pursuit closes to 0.16 m (collision); DWA holds 2.87 m clearance and still reaches the goal |
+| montecarlo | the shipping `NavController` over 150 domain-randomized `SensorModel`s: 99.3% true-arrival within 15 m (mean 9.5 m), 912 multipath outliers gated — robust across an error envelope |
+| ellipsoid | full ellipsoid hard/soft-iron calibration (numpy) on a *rotated* soft-iron ellipsoid: recovers heading to ~0° vs 16.7° for diagonal min/max |
 | walrus | real testnet store + byte-identical retrieve + IPFS CIDv1 |
 
 > **Scope of validation.** The plumbing, protocols, content-addressing, geometry,

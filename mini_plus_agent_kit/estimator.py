@@ -218,6 +218,8 @@ class MagnetometerCalibrator:
         self.samples: list[tuple[float, float, float]] = []
         self.offset = (0.0, 0.0, 0.0)
         self.scale = (1.0, 1.0, 1.0)
+        self._center = None       # ellipsoid-fit centre (numpy array)
+        self._T = None            # ellipsoid-fit shaping matrix (3×3, numpy)
 
     def add(self, mx: float, my: float, mz: float) -> None:
         self.samples.append((mx, my, mz))
@@ -243,3 +245,37 @@ class MagnetometerCalibrator:
         """Calibrated tilt-free heading from a raw magnetometer reading."""
         cx, cy, _ = self.apply(mx, my, mz)
         return mag_heading_deg(cx, cy, declination_deg)
+
+    # --- full ellipsoid fit (numpy) — handles off-diagonal (rotated) soft-iron ---
+    def fit_ellipsoid(self) -> None:
+        """Least-squares fit a general ellipsoid; recover centre + shaping matrix.
+
+        Solves ``Xᵀ A X + 2nᵀX = 1`` for the samples, giving centre ``c = −A⁻¹n`` and a
+        shaping matrix ``T`` (matrix square root of ``A/k``) so that ``T(m − c)`` maps
+        the ellipsoid to the unit sphere — correcting hard-iron *and* full (rotated)
+        soft-iron, which the diagonal min/max method cannot. Requires numpy.
+        """
+        import numpy as np
+
+        P = np.asarray(self.samples, float)
+        x, y, z = P[:, 0], P[:, 1], P[:, 2]
+        D = np.column_stack([x * x, y * y, z * z, 2 * y * z, 2 * x * z, 2 * x * y,
+                             2 * x, 2 * y, 2 * z])
+        v, *_ = np.linalg.lstsq(D, np.ones(len(x)), rcond=None)
+        a, b, c, f, g, h, p, q, r = v
+        A = np.array([[a, h, g], [h, b, f], [g, f, c]])
+        n = np.array([p, q, r])
+        center = np.linalg.solve(A, -n)
+        k = 1.0 - n.dot(center)                       # quadratic form value at the centre
+        w, V = np.linalg.eigh(A / k)                  # A/k = V diag(w) Vᵀ  (SPD)
+        self._T = V @ np.diag(np.sqrt(np.abs(w))) @ V.T
+        self._center = center
+
+    def apply_ellipsoid(self, mx: float, my: float, mz: float):
+        import numpy as np
+        return self._T @ (np.array([mx, my, mz], float) - self._center)
+
+    def heading_ellipsoid_deg(self, mx: float, my: float, mz: float,
+                              declination_deg: float = 0.0) -> float:
+        c = self.apply_ellipsoid(mx, my, mz)
+        return mag_heading_deg(float(c[0]), float(c[1]), declination_deg)
